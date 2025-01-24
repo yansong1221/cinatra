@@ -20,17 +20,17 @@
 #include "asio/dispatch.hpp"
 #include "asio/error.hpp"
 #include "asio/experimental/awaitable_operators.hpp"
+#include "asio/redirect_error.hpp"
+#include "asio/steady_timer.hpp"
+#include "asio/stream_file.hpp"
 #include "asio/streambuf.hpp"
-#include "async_simple/Future.h"
-#include "async_simple/Unit.h"
-#include "async_simple/coro/FutureAwaiter.h"
-#include "async_simple/coro/Lazy.h"
 #ifdef CINATRA_ENABLE_GZIP
 #include "gzip.hpp"
 #endif
 #ifdef CINATRA_ENABLE_BROTLI
 #include "brzip.hpp"
 #endif
+#include "asio.hpp"
 #include "cinatra_log_wrapper.hpp"
 #include "http_parser.hpp"
 #include "multipart.hpp"
@@ -39,9 +39,6 @@
 #include "string_resize.hpp"
 #include "uri.hpp"
 #include "websocket.hpp"
-#include "ylt/coro_io/coro_file.hpp"
-#include "ylt/coro_io/coro_io.hpp"
-#include "ylt/coro_io/io_context_pool.hpp"
 
 namespace coro_io {
 template <typename T, typename U>
@@ -103,7 +100,7 @@ struct req_context {
   req_content_type content_type = req_content_type::none;
   std::string req_header; /*header string*/
   String content;         /*body*/
-  coro_io::coro_file *resp_body_stream = nullptr;
+  std::shared_ptr<asio::stream_file> resp_body_stream;
 };
 
 struct multipart_t {
@@ -146,9 +143,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         head_buf_(socket_->head_buf_),
         chunked_buf_(socket_->chunked_buf_) {}
 
-  coro_http_client(
-      coro_io::ExecutorWrapper<> *executor = coro_io::get_global_executor())
-      : coro_http_client(executor->get_asio_executor()) {}
+  coro_http_client(asio::io_context &ioc)
+      : coro_http_client(ioc.get_executor()) {}
 
   bool init_config(const config &conf) {
     config_ = conf;
@@ -191,6 +187,25 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     asio::dispatch(executor_wrapper_, [socket = socket_] {
       close_socket(*socket);
     });
+  }
+
+  template <typename T, typename Executor>
+  static asio::awaitable<std::optional<T>, Executor> exec_with_timeout(
+      asio::awaitable<T, Executor> &&task,
+      std::chrono::steady_clock::duration duration) {
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(duration);
+    std::error_code ec;
+
+    auto result =
+        co_await (std::move(task) || timer.async_wait(asio::redirect_error(
+                                         asio::use_awaitable, ec)));
+
+    auto pval = std::get_if<T>(&result);
+    if (pval)
+      co_return *pval;
+    else
+      co_return std::nullopt;
   }
 
   asio::any_io_executor &get_executor() { return executor_wrapper_; }
@@ -301,9 +316,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     if (!ok) {
       co_return resp_data{std::make_error_code(std::errc::protocol_error), 404};
     }
-    {
-      auto time_out_guard =
-          timer_guard(this, conn_timeout_duration_, "connect timer");
+    auto connect_function = [&]() -> asio::awaitable<bool> {
       if (u.is_websocket()) {
         // build websocket http header
         add_header("Upgrade", "websocket");
@@ -337,15 +350,19 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
           }
         }
 #endif
-        co_return data;
+        co_return true;
       }
       data = co_await connect(u);
-    }
-    if (socket_->is_timeout_) {
+      if (!data.net_err) {
+        data.status = 200;
+      }
+      co_return true;
+    }();
+    co_await std::move(connect_function);
+    auto result = co_await exec_with_timeout(std::move(connect_function),
+                                             conn_timeout_duration_);
+    if (!result) {
       co_return resp_data{std::make_error_code(std::errc::timed_out), 404};
-    }
-    if (!data.net_err) {
-      data.status = 200;
     }
     co_return data;
   }
@@ -568,15 +585,20 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
   resp_data get(std::string uri,
                 std::unordered_map<std::string, std::string> headers = {}) {
-    return async_simple::coro::syncAwait(
-        async_get(std::move(uri), std::move(headers)));
+    auto result = asio::co_spawn(executor_wrapper_,
+                                 async_get(std::move(uri), std::move(headers)),
+                                 asio::use_future);
+    return result.get();
   }
 
   resp_data post(std::string uri, std::string content,
                  req_content_type content_type,
                  std::unordered_map<std::string, std::string> headers = {}) {
-    return async_simple::coro::syncAwait(async_post(
-        std::move(uri), std::move(content), content_type, std::move(headers)));
+    auto result = asio::co_spawn(executor_wrapper_,
+                                 async_post(std::move(uri), std::move(content),
+                                            content_type, std::move(headers)),
+                                 asio::use_future);
+    return result.get();
   }
 
   asio::awaitable<resp_data> async_post(
@@ -635,36 +657,15 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
   void set_max_single_part_size(size_t size) { max_single_part_size_ = size; }
 
-  struct timer_guard {
-    timer_guard(coro_http_client *self,
-                std::chrono::steady_clock::duration duration, std::string msg)
-        : self(self), dur_(duration) {
-      self->socket_->is_timeout_ = false;
-
-      if (duration.count() >= 0) {
-        self->timeout(self->timer_, duration, std::move(msg))
-            .start([](auto &&) {
-            });
-      }
-      return;
-    }
-    ~timer_guard() {
-      if (dur_.count() > 0 && self->socket_->is_timeout_ == false) {
-        std::error_code ignore_ec;
-        self->timer_.cancel(ignore_ec);
-      }
-    }
-    coro_http_client *self;
-    std::chrono::steady_clock::duration dur_;
-  };
-
   asio::awaitable<resp_data> async_download(std::string uri,
                                             std::string filename,
                                             std::string range = "") {
     resp_data data{};
-    coro_io::coro_file file;
-    file.open(filename, std::ios::trunc | std::ios::out);
-    if (!file.is_open()) {
+    auto file =
+        std::make_shared<asio::stream_file>(co_await asio::this_coro::executor);
+    file->open(filename,
+               asio::stream_file::truncate | asio::stream_file::write_only);
+    if (!file->is_open()) {
       data.net_err = std::make_error_code(std::errc::no_such_file_or_directory);
       data.status = 404;
       co_return data;
@@ -673,12 +674,12 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     req_context<> ctx{};
     if (range.empty()) {
       add_header("Transfer-Encoding", "chunked");
-      ctx = {req_content_type::none, "", "", &file};
+      ctx = {req_content_type::none, "", "", file};
     }
     else {
       std::string req_str = "Range: bytes=";
       req_str.append(range).append(CRCF);
-      ctx = {req_content_type::none, std::move(req_str), {}, &file};
+      ctx = {req_content_type::none, std::move(req_str), {}, file};
     }
 
     data = co_await async_request(std::move(uri), http_method::GET,
@@ -689,8 +690,11 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
   resp_data download(std::string uri, std::string filename,
                      std::string range = "") {
-    return async_simple::coro::syncAwait(
-        async_download(std::move(uri), std::move(filename), std::move(range)));
+    auto result = asio::co_spawn(
+        executor_wrapper_,
+        async_download(std::move(uri), std::move(filename), std::move(range)),
+        asio::use_future);
+    return result.get();
   }
 
   bool is_body_in_out_buf() const { return !out_buf_.empty(); }
@@ -700,7 +704,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       close_socket(*socket_);
     }
 
-    socket_->impl_ = asio::ip::tcp::socket{executor_wrapper_.context()};
+    socket_->impl_ = asio::ip::tcp::socket{executor_wrapper_};
     if (!socket_->impl_.is_open()) {
       std::error_code ec;
       socket_->impl_.open(asio::ip::tcp::v4(), ec);
@@ -1090,24 +1094,17 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
   }
 
   asio::awaitable<bool> reconnect(resp_data &data, uri_t u) {
-    {
-      asio::steady_timer timer(co_await asio::this_coro::executor);
-      timer.expires_after(conn_timeout_duration_);
-      std::error_code ec;
-      auto v = co_await (connect(u) || timer.async_wait(asio::redirect_error(
-                                           asio::use_awaitable, ec)));
-      auto pval = std::get_if<resp_data>(&v);
-      if (pval) {
-        data = std::move(*pval);
-      }
-      else {
-        data = resp_data{std::make_error_code(std::errc::timed_out), 404};
-      }
+    auto result =
+        co_await exec_with_timeout(connect(u), conn_timeout_duration_);
+    if (result)
+      data = std::move(*result);
+    else {
+      data = resp_data{std::make_error_code(std::errc::timed_out), 404};
     }
+
     if (data.net_err) {
       co_return false;
     }
-
     co_return true;
   }
 
@@ -1131,7 +1128,6 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       int64_t content_length = -1 /*upload size*/) {
     std::error_code ec{};
     size_t size = 0;
-    bool is_keep_alive = true;
     req_context<> ctx{content_type};
     resp_data data{};
 
@@ -1182,8 +1178,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     timer.expires_after(req_timeout_duration_);
 
     auto v = co_await (
-        async_upload_impl_ex<upload_type, Source>(source, header_str, offset,
-                                                  content_length) ||
+        async_upload_impl_ex<upload_type, Source, std::string>(
+            source, std::move(ctx), header_str, offset, content_length) ||
         timer.async_wait(asio::redirect_error(asio::use_awaitable, ec)));
 
     auto pval = std::get_if<resp_data>(&v);
@@ -1194,8 +1190,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       co_return resp_data{std::make_error_code(std::errc::timed_out), 404};
     }
   }
-  template <upload_type_t upload_type, typename Source>
+  template <upload_type_t upload_type, typename Source, typename String>
   asio::awaitable<resp_data> async_upload_impl_ex(Source source /* file */,
+                                                  req_context<String> &&ctx,
                                                   const std::string &header_str,
                                                   uint64_t offset,
                                                   int64_t content_length) {
@@ -1264,9 +1261,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     if (ec) {
       co_return resp_data{ec, 404};
     }
-
-    data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
-                                http_method::POST);
+    bool is_keep_alive = true;
+    auto data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
+                                     http_method::POST);
     if (ec) {
       ;
     }
@@ -1396,22 +1393,31 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #ifdef CORO_HTTP_PRINT_REQ_HEAD
       CINATRA_LOG_DEBUG << req_head_str;
 #endif
-      auto guard = timer_guard(this, req_timeout_duration_, "request timer");
-      if (has_body) {
-        std::tie(ec, size) = co_await async_write(vec);
+      auto exec_function = [&]() -> asio::awaitable<bool> {
+        if (has_body) {
+          size = co_await async_write(
+              vec, asio::redirect_error(asio::use_awaitable, ec));
+        }
+        else {
+          size = co_await async_write(
+              asio::buffer(req_head_str),
+              asio::redirect_error(asio::use_awaitable, ec));
+        }
+        if (ec) {
+          co_return false;
+        }
+        data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
+                                    method);
+        co_return true;
+      }();
+
+      auto result = co_await exec_with_timeout(std::move(exec_function),
+                                               req_timeout_duration_);
+      if (!result) {
+        data = resp_data{std::make_error_code(std::errc::timed_out), 404};
       }
-      else {
-        std::tie(ec, size) = co_await async_write(asio::buffer(req_head_str));
-      }
-      if (ec) {
-        break;
-      }
-      data =
-          co_await handle_read(ec, size, is_keep_alive, std::move(ctx), method);
     } while (0);
-    if (ec && socket_->is_timeout_) {
-      ec = std::make_error_code(std::errc::timed_out);
-    }
+
     handle_result(data, ec, is_keep_alive);
     co_return data;
   }
@@ -1713,8 +1719,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
                                          http_method method) {
     resp_data data{};
     do {
-      if (std::tie(ec, size) = co_await async_read_until(head_buf_, TWO_CRCF);
-          ec) {
+      size = co_await async_read_until(
+          head_buf_, TWO_CRCF, asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
 
@@ -1827,18 +1834,18 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       head_buf_.consume(part_size);
 
       if (is_out_buf) {
-        if (std::tie(ec, size) = co_await async_read(
-                asio::buffer(out_buf_.data() + part_size, size_to_read),
-                size_to_read);
-            ec) {
+        size = co_await async_read(
+            asio::buffer(out_buf_.data() + part_size, size_to_read),
+            asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
           break;
         }
       }
       else {
-        if (std::tie(ec, size) = co_await async_read(
-                asio::buffer(body_.data() + part_size, size_to_read),
-                size_to_read);
-            ec) {
+        size = co_await async_read(
+            asio::buffer(body_.data() + part_size, size_to_read),
+            asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
           break;
         }
       }
@@ -1874,8 +1881,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
       if (is_ranges) {
         if (ctx.resp_body_stream) {
-          auto [ec, size] = co_await ctx.resp_body_stream->async_write(
-              {data_ptr, content_len});
+          std::error_code ec;
+          auto size = co_await asio::async_write(
+              *ctx.resp_body_stream, asio::buffer(data_ptr, content_len),
+              asio::redirect_error(asio::use_awaitable, ec));
           if (ec) {
             data.net_err = ec;
             co_return;
@@ -1961,9 +1970,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       auto part_body = co_await multipart.read_part_body(boundary);
 
       if (ctx.resp_body_stream) {
-        size_t size;
-        std::tie(ec, size) =
-            co_await ctx.resp_body_stream->async_write(part_body.data);
+        auto size = co_await asio::async_write(
+            *ctx.resp_body_stream, asio::buffer(part_body.data),
+            asio::redirect_error(asio::use_awaitable, ec));
       }
       else {
         resp_chunk_str_.append(part_body.data.data(), part_body.data.size());
@@ -1986,8 +1995,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     std::error_code ec{};
     size_t size = 0;
     while (true) {
-      if (std::tie(ec, size) = co_await async_read_until(chunked_buf_, CRCF);
-          ec) {
+      size = co_await async_read_until(
+          chunked_buf_, CRCF, asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
 
@@ -2008,9 +2018,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       if (additional_size < size_t(chunk_size + 2)) {
         // not a complete chunk, read left chunk data.
         size_t size_to_read = chunk_size + 2 - additional_size;
-        if (std::tie(ec, size) =
-                co_await async_read(chunked_buf_, size_to_read);
-            ec) {
+        size =
+            co_await async_read(chunked_buf_, size_to_read,
+                                asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
           break;
         }
       }
@@ -2024,8 +2035,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
       data_ptr = asio::buffer_cast<const char *>(chunked_buf_.data());
       if (ctx.resp_body_stream) {
-        std::tie(ec, size) = co_await ctx.resp_body_stream->async_write(
-            {data_ptr, (size_t)chunk_size});
+        size = co_await asio::async_write(
+            *ctx.resp_body_stream, asio::buffer(data_ptr, chunk_size),
+            asio::redirect_error(asio::use_awaitable, ec));
       }
       else {
         resp_chunk_str_.append(data_ptr, chunk_size);
@@ -2213,9 +2225,11 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #endif
     websocket ws{};
     while (true) {
-      if (auto [ec, _] = co_await async_read_ws(
-              sock, read_buf, ws.left_header_len(), has_init_ssl);
-          ec) {
+      std::error_code ec;
+      co_await async_read_ws(sock, read_buf, ws.left_header_len(),
+                             asio::redirect_error(asio::use_awaitable, ec),
+                             has_init_ssl);
+      if (ec) {
         if (socket_->is_timeout_) {
           co_return resp_data{std::make_error_code(std::errc::timed_out), 404};
         }
@@ -2249,9 +2263,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
       size_t payload_len = ws.payload_length();
 
-      if (auto [ec, size] =
-              co_await async_read_ws(sock, read_buf, payload_len, has_init_ssl);
-          ec) {
+      auto size = co_await async_read_ws(
+          sock, read_buf, payload_len,
+          asio::redirect_error(asio::use_awaitable, ec), has_init_ssl);
+      if (ec) {
         data.net_err = ec;
         data.status = 404;
         close_socket(*sock);
@@ -2293,7 +2308,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         std::vector<asio::const_buffer> buffers{asio::buffer(encode_header),
                                                 asio::buffer(reason)};
 
-        co_await async_write_ws(sock, buffers, has_init_ssl);
+        std::error_code ec;
+        co_await async_write_ws(sock, buffers,
+                                asio::redirect_error(asio::use_awaitable, ec),
+                                has_init_ssl);
 
         close_socket(*sock);
 
@@ -2305,40 +2323,42 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
   }
 
-  template <typename AsioBuffer>
-  asio::awaitable<std::pair<std::error_code, size_t>> async_read_ws(
-      auto sock, AsioBuffer &&buffer, size_t size_to_read,
-      bool has_init_ssl = false) noexcept {
+  template <typename Allocator, typename ReadHandler>
+  auto async_read_ws(auto sock, asio::basic_streambuf<Allocator> &b,
+                     size_t size_to_read, ReadHandler &&handler,
+                     bool has_init_ssl = false) noexcept {
 #ifdef CINATRA_ENABLE_SSL
     if (has_init_ssl) {
-      return coro_io::async_read(*sock->ssl_stream_, buffer, size_to_read);
+      return asio::async_read(*sock->ssl_stream_, b,
+                              asio::transfer_exactly(size_to_read), handler);
     }
     else {
 #endif
-      return coro_io::async_read(sock->impl_, buffer, size_to_read);
+      return asio::async_read(sock->impl_, b,
+                              asio::transfer_exactly(size_to_read), handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
   }
 
-  template <typename AsioBuffer>
-  asio::awaitable<std::pair<std::error_code, size_t>> async_write_ws(
-      auto sock, AsioBuffer &&buffer, bool has_init_ssl = false) {
+  template <typename ConstBufferSequence, typename WriteHandler>
+  auto async_write_ws(auto sock, const ConstBufferSequence &buffers,
+                      WriteHandler &&handler, bool has_init_ssl = false) {
 #ifdef CINATRA_ENABLE_SSL
     if (has_init_ssl) {
-      return coro_io::async_write(*sock->ssl_stream_, buffer);
+      return asio::async_write(*sock->ssl_stream_, buffers, handler);
     }
     else {
 #endif
-      return coro_io::async_write(sock->impl_, buffer);
+      return asio::async_write(sock->impl_, buffers, handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
   }
 
-  template <typename AsioBuffer>
-  asio::awaitable<std::pair<std::error_code, size_t>> async_read(
-      AsioBuffer &&buffer, size_t size_to_read) noexcept {
+  template <typename Allocator, typename ReadHandler>
+  auto async_read(asio::basic_streambuf<Allocator> &b, size_t size_to_read,
+                  ReadHandler &&handler) noexcept {
 #ifdef INJECT_FOR_HTTP_CLIENT_TEST
     if (read_failed_forever_) {
       return async_read_failed();
@@ -2346,11 +2366,33 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #endif
 #ifdef CINATRA_ENABLE_SSL
     if (has_init_ssl_) {
-      return coro_io::async_read(*socket_->ssl_stream_, buffer, size_to_read);
+      return asio::async_read(*socket_->ssl_stream_, b,
+                              asio::transfer_exactly(size_to_read), handler);
     }
     else {
 #endif
-      return coro_io::async_read(socket_->impl_, buffer, size_to_read);
+      return asio::async_read(socket_->impl_, b,
+                              asio::transfer_exactly(size_to_read), handler);
+#ifdef CINATRA_ENABLE_SSL
+    }
+#endif
+  }
+
+  template <typename MutableBufferSequence, typename ReadHandler>
+  auto async_read(const MutableBufferSequence &buffers,
+                  ReadHandler &&handler) noexcept {
+#ifdef INJECT_FOR_HTTP_CLIENT_TEST
+    if (read_failed_forever_) {
+      return async_read_failed();
+    }
+#endif
+#ifdef CINATRA_ENABLE_SSL
+    if (has_init_ssl_) {
+      return asio::async_read(*socket_->ssl_stream_, buffers, handler);
+    }
+    else {
+#endif
+      return asio::async_read(socket_->impl_, buffers, handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
@@ -2385,9 +2427,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #endif
   }
 
-  template <typename AsioBuffer>
-  asio::awaitable<std::pair<std::error_code, size_t>> async_read_until(
-      AsioBuffer &buffer, asio::string_view delim) noexcept {
+  template <typename Allocator, typename ReadHandler>
+  auto async_read_until(asio::basic_streambuf<Allocator> &buffer,
+                        const std::string &delim,
+                        ReadHandler &&handler) noexcept {
 #ifdef INJECT_FOR_HTTP_CLIENT_TEST
     if (read_failed_forever_) {
       return async_read_failed();
@@ -2395,11 +2438,12 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #endif
 #ifdef CINATRA_ENABLE_SSL
     if (has_init_ssl_) {
-      return coro_io::async_read_until(*socket_->ssl_stream_, buffer, delim);
+      return asio::async_read_until(*socket_->ssl_stream_, buffer, delim,
+                                    handler);
     }
     else {
 #endif
-      return coro_io::async_read_until(socket_->impl_, buffer, delim);
+      return asio::async_read_until(socket_->impl_, buffer, delim, handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif

@@ -65,15 +65,16 @@ asio::awaitable<resp_data> chunked_upload1(coro_http_client &client) {
   std::string filename = "test.txt";
   create_file(filename, 1010);
 
-  coro_io::coro_file file{};
+  std::ifstream file{};
   file.open(filename, std::ios::in);
 
   std::string buf;
   cinatra::detail::resize(buf, 100);
 
   auto fn = [&file, &buf]() -> asio::awaitable<read_result> {
-    auto [ec, size] = co_await file.async_read(buf.data(), buf.size());
-    co_return read_result{{buf.data(), buf.size()}, file.eof(), ec};
+    file.read(buf.data(), buf.size());
+    auto sz = file.gcount();
+    co_return read_result{{buf.data(), sz}, file.eof(), std::error_code()};
   };
 
   auto result = co_await client.async_upload_chunked(

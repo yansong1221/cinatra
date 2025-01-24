@@ -11,8 +11,7 @@ class multipart_reader_t {
         head_buf_(conn_->head_buf_),
         chunked_buf_(conn_->chunked_buf_) {}
 
-  async_simple::coro::Lazy<part_head_t> read_part_head(
-      std::string_view boundary) {
+  asio::awaitable<part_head_t> read_part_head(std::string_view boundary) {
     if (boundary.empty()) {
       co_return part_head_t{std::make_error_code(std::errc::protocol_error)};
     }
@@ -38,9 +37,9 @@ class multipart_reader_t {
     constexpr std::string_view filename = "filename=\"";
 
     while (true) {
-      if (std::tie(ec, size) =
-              co_await conn_->async_read_until(chunked_buf_, CRCF);
-          ec) {
+      size = co_await conn_->async_read_until(
+          chunked_buf_, CRCF, asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         result.ec = ec;
         conn_->close();
         co_return result;
@@ -70,15 +69,14 @@ class multipart_reader_t {
     co_return result;
   }
 
-  async_simple::coro::Lazy<chunked_result> read_part_body(
-      std::string_view boundary) {
+  asio::awaitable<chunked_result> read_part_body(const std::string &boundary) {
     chunked_result result{};
     std::error_code ec{};
     size_t size = 0;
 
-    if (std::tie(ec, size) =
-            co_await conn_->async_read_until(chunked_buf_, boundary);
-        ec) {
+    size = co_await conn_->async_read_until(
+        chunked_buf_, boundary, asio::redirect_error(asio::use_awaitable, ec));
+    if (ec) {
       result.ec = ec;
       conn_->close();
       co_return result;
@@ -89,9 +87,9 @@ class multipart_reader_t {
     result.data = std::string_view{
         data_ptr, size - boundary.size() - 4};  //-- boundary \r\n
 
-    if (std::tie(ec, size) =
-            co_await conn_->async_read_until(chunked_buf_, CRCF);
-        ec) {
+    size = co_await conn_->async_read_until(
+        chunked_buf_, CRCF, asio::redirect_error(asio::use_awaitable, ec));
+    if (ec) {
       result = {};
       result.ec = ec;
       conn_->close();

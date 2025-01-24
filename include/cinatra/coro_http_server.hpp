@@ -169,7 +169,7 @@ class coro_http_server {
                   "must be member function");
     using return_type = typename util::function_traits<Func>::return_type;
     if constexpr (coro_io::is_lazy_v<return_type>) {
-      std::function<async_simple::coro::Lazy<void>(coro_http_request & req,
+      std::function<asio::awaitable<void>(coro_http_request & req,
                                                    coro_http_response & resp)>
           f = std::bind(handler, &owner, std::placeholders::_1,
                         std::placeholders::_2);
@@ -203,11 +203,11 @@ class coro_http_server {
     auto handler =
         [this, load_blancer, type](
             coro_http_request &req,
-            coro_http_response &response) -> async_simple::coro::Lazy<void> {
+            coro_http_response &response) -> asio::awaitable<void> {
       co_await load_blancer->send_request(
           [this, &req, &response](
               coro_http_client &client,
-              std::string_view host) -> async_simple::coro::Lazy<void> {
+              std::string_view host) -> asio::awaitable<void> {
             co_await reply(client, host, req, response);
           });
     };
@@ -244,7 +244,7 @@ class coro_http_server {
     set_http_handler<cinatra::GET>(
         url_path,
         [load_blancer](coro_http_request &req, coro_http_response &resp)
-            -> async_simple::coro::Lazy<void> {
+            -> asio::awaitable<void> {
           websocket_result result{};
           while (true) {
             result = co_await req.get_conn()->read_websocket();
@@ -259,7 +259,7 @@ class coro_http_server {
 
             auto ret = co_await load_blancer->send_request(
                 [&req, result](coro_http_client &client, std::string_view host)
-                    -> async_simple::coro::Lazy<std::error_code> {
+                    -> asio::awaitable<std::error_code> {
                   auto r =
                       co_await client.write_websocket(std::string(result.data));
                   if (r.net_err) {
@@ -391,7 +391,7 @@ class coro_http_server {
           uri,
           [this, file_name = file](
               coro_http_request &req,
-              coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+              coro_http_response &resp) -> asio::awaitable<void> {
             std::string_view extension = get_extension(file_name);
             std::string_view mime = get_mime_type(extension);
             auto range_str = req.get_header_value("Range");
@@ -579,7 +579,7 @@ class coro_http_server {
 
   void set_shrink_to_fit(bool r) { need_shrink_every_time_ = r; }
 
-  void set_default_handler(std::function<async_simple::coro::Lazy<void>(
+  void set_default_handler(std::function<asio::awaitable<void>(
                                coro_http_request &, coro_http_response &)>
                                handler) {
     default_handler_ = std::move(handler);
@@ -653,7 +653,7 @@ class coro_http_server {
     return {};
   }
 
-  async_simple::coro::Lazy<std::error_code> accept() {
+  asio::awaitable<std::error_code> accept() {
     for (;;) {
       coro_io::ExecutorWrapper<> *executor;
       if (out_ctx_ == nullptr) {
@@ -727,7 +727,7 @@ class coro_http_server {
     }
   }
 
-  async_simple::coro::Lazy<void> start_one(
+  asio::awaitable<void> start_one(
       std::shared_ptr<coro_http_connection> conn) noexcept {
     co_await conn->start();
   }
@@ -829,7 +829,7 @@ class coro_http_server {
     return header_str;
   }
 
-  async_simple::coro::Lazy<bool> send_single_part(auto &in_file, auto &content,
+  asio::awaitable<bool> send_single_part(auto &in_file, auto &content,
                                                   auto &req, auto &resp,
                                                   size_t part_size,
                                                   std::string_view more = "") {
@@ -906,7 +906,7 @@ class coro_http_server {
     }
   }
 
-  async_simple::coro::Lazy<void> reply(coro_http_client &client,
+  asio::awaitable<void> reply(coro_http_client &client,
                                        std::string_view host,
                                        coro_http_request &req,
                                        coro_http_response &response) {
@@ -1003,7 +1003,7 @@ class coro_http_server {
 #endif
   coro_http_router router_;
   bool need_shrink_every_time_ = false;
-  std::function<async_simple::coro::Lazy<void>(coro_http_request &,
+  std::function<asio::awaitable<void>(coro_http_request &,
                                                coro_http_response &)>
       default_handler_ = nullptr;
   int64_t max_http_body_len_ = MAX_HTTP_BODY_SIZE;
