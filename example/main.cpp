@@ -19,7 +19,7 @@ void create_file(std::string filename, size_t file_size = 64) {
   }
 }
 
-async_simple::coro::Lazy<void> byte_ranges_download() {
+asio::awaitable<void> byte_ranges_download() {
   create_file("test_multiple_range.txt", 64);
   coro_http_server server(1, 8090);
   server.set_static_res_dir("", "");
@@ -61,7 +61,7 @@ async_simple::coro::Lazy<void> byte_ranges_download() {
   }
 }
 
-async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
+asio::awaitable<resp_data> chunked_upload1(coro_http_client &client) {
   std::string filename = "test.txt";
   create_file(filename, 1010);
 
@@ -71,7 +71,7 @@ async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
   std::string buf;
   cinatra::detail::resize(buf, 100);
 
-  auto fn = [&file, &buf]() -> async_simple::coro::Lazy<read_result> {
+  auto fn = [&file, &buf]() -> asio::awaitable<read_result> {
     auto [ec, size] = co_await file.async_read(buf.data(), buf.size());
     co_return read_result{{buf.data(), buf.size()}, file.eof(), ec};
   };
@@ -81,12 +81,12 @@ async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
   co_return result;
 }
 
-async_simple::coro::Lazy<void> chunked_upload_download() {
+asio::awaitable<void> chunked_upload_download() {
   cinatra::coro_http_server server(1, 9001);
   server.set_http_handler<cinatra::GET, cinatra::POST>(
       "/chunked",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         assert(req.get_content_type() == content_type::chunked);
         chunked_result result{};
         std::string content;
@@ -112,7 +112,7 @@ async_simple::coro::Lazy<void> chunked_upload_download() {
   server.set_http_handler<cinatra::GET, cinatra::POST>(
       "/write_chunked",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         resp.set_format_type(format_type::chunked);
         bool ok;
         if (ok = co_await resp.get_conn()->begin_chunked(); !ok) {
@@ -150,12 +150,12 @@ async_simple::coro::Lazy<void> chunked_upload_download() {
   assert(result.resp_body == "hello world ok");
 }
 
-async_simple::coro::Lazy<void> use_websocket() {
+asio::awaitable<void> use_websocket() {
   coro_http_server server(1, 9001);
   server.set_http_handler<cinatra::GET>(
       "/ws_echo",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         assert(req.get_content_type() == content_type::websocket);
         websocket_result result{};
         while (true) {
@@ -210,7 +210,7 @@ async_simple::coro::Lazy<void> use_websocket() {
   assert(data.resp_body == "test again");
 }
 
-async_simple::coro::Lazy<void> static_file_server() {
+asio::awaitable<void> static_file_server() {
   std::string filename = "temp.txt";
   create_file(filename, 64);
 
@@ -252,7 +252,7 @@ struct get_data {
   }
 };
 
-async_simple::coro::Lazy<void> use_aspects() {
+asio::awaitable<void> use_aspects() {
   coro_http_server server(1, 9001);
   server.set_http_handler<GET>(
       "/get",
@@ -279,7 +279,7 @@ struct person_t {
   }
 };
 
-async_simple::coro::Lazy<void> basic_usage() {
+asio::awaitable<void> basic_usage() {
   coro_http_server server(1, 9001);
   server.set_http_handler<GET>(
       "/get", [](coro_http_request &req, coro_http_response &resp) {
@@ -289,7 +289,7 @@ async_simple::coro::Lazy<void> basic_usage() {
   server.set_http_handler<GET>(
       "/coro",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         resp.set_status_and_content(status_type::ok, "ok");
         co_return;
       });
@@ -297,7 +297,7 @@ async_simple::coro::Lazy<void> basic_usage() {
   server.set_http_handler<POST>(
       "/form_data",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         assert(req.get_content_type() == content_type::multipart);
         auto boundary = req.get_boundary();
         multipart_reader_t multipart(req.get_conn());
@@ -330,7 +330,7 @@ async_simple::coro::Lazy<void> basic_usage() {
   server.set_http_handler<GET>(
       "/in_thread_pool",
       [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+         coro_http_response &resp) -> asio::awaitable<void> {
         // will respose in another thread.
         co_await coro_io::post([&] {
           // do your heavy work here when finished work, response.
@@ -423,7 +423,7 @@ async_simple::coro::Lazy<void> basic_usage() {
   result.net_err.value() assert(result.status == 200);
 #endif
 }
-async_simple::coro::Lazy<void> use_channel() {
+asio::awaitable<void> use_channel() {
   coro_http_server server(1, 9001);
   server.set_http_handler<GET>(
       "/", [&](coro_http_request &req, coro_http_response &resp) {
@@ -438,14 +438,14 @@ async_simple::coro::Lazy<void> use_channel() {
   std::string url = "http://127.0.0.1:9001/";
   co_await channel->send_request(
       [&url](coro_http_client &client,
-             std::string_view host) -> async_simple::coro::Lazy<void> {
+             std::string_view host) -> asio::awaitable<void> {
         auto data = co_await client.async_get(url);
         std::cout << data.net_err.message() << "\n";
         std::cout << data.resp_body << "\n";
       });
 }
 
-async_simple::coro::Lazy<void> use_pool() {
+asio::awaitable<void> use_pool() {
   coro_http_server server(1, 9001);
   server.set_http_handler<GET>(
       "/", [&](coro_http_request &req, coro_http_response &resp) {
@@ -461,7 +461,7 @@ async_simple::coro::Lazy<void> use_pool() {
   std::atomic<size_t> count = 0;
   for (size_t i = 0; i < 10000; i++) {
     pool->send_request(
-            [&](coro_http_client &client) -> async_simple::coro::Lazy<void> {
+            [&](coro_http_client &client) -> asio::awaitable<void> {
               auto data = co_await client.async_get(url);
               std::cout << data.resp_body << "\n";
             })
