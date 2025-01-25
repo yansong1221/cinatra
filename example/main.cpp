@@ -32,7 +32,7 @@ asio::awaitable<void> byte_ranges_download() {
     std::error_code ec{};
     std::filesystem::remove(filename, ec);
 
-    coro_http_client client{};
+    coro_http_client client{co_await asio::this_coro::executor};
     resp_data result = co_await client.async_download(uri, filename, "1-10");
     assert(result.status == 206);
     assert(std::filesystem::file_size(filename) == 10);
@@ -45,7 +45,7 @@ asio::awaitable<void> byte_ranges_download() {
   }
 
   {
-    coro_http_client client{};
+    coro_http_client client{co_await asio::this_coro::executor};
     std::string uri = "http://127.0.0.1:8090/test_multiple_range.txt";
 
     client.add_header("Range", "bytes=1-10,20-30");
@@ -59,6 +59,7 @@ asio::awaitable<void> byte_ranges_download() {
     assert(result.status == 206);
     assert(fs::file_size(filename) == 21);
   }
+  getchar();
 }
 
 asio::awaitable<resp_data> chunked_upload1(coro_http_client &client) {
@@ -66,15 +67,18 @@ asio::awaitable<resp_data> chunked_upload1(coro_http_client &client) {
   create_file(filename, 1010);
 
   std::ifstream file{};
-  file.open(filename, std::ios::in);
+  file.open(filename, std::ios::in | std::ios::binary);
 
   std::string buf;
   cinatra::detail::resize(buf, 100);
 
-  auto fn = [&file, &buf]() -> asio::awaitable<read_result> {
+  auto fn = [&]() -> asio::awaitable<read_result> {
     file.read(buf.data(), buf.size());
     auto sz = file.gcount();
-    co_return read_result{{buf.data(), sz}, file.eof(), std::error_code()};
+    read_result res;
+    res.buf = {buf.data(), (std::size_t)sz};
+    res.eof = file.eof();
+    co_return res;
   };
 
   auto result = co_await client.async_upload_chunked(
@@ -134,7 +138,7 @@ asio::awaitable<void> chunked_upload_download() {
   server.async_start();
   std::this_thread::sleep_for(200ms);
 
-  coro_http_client client{};
+  coro_http_client client{co_await asio::this_coro::executor};
   auto r = co_await chunked_upload1(client);
   assert(r.status == 200);
   assert(r.resp_body == "chunked ok");
@@ -195,7 +199,7 @@ asio::awaitable<void> use_websocket() {
   server.async_start();
   std::this_thread::sleep_for(300ms);  // wait for server start
 
-  coro_http_client client{};
+  coro_http_client client{co_await asio::this_coro::executor};
   auto r = co_await client.connect("ws://127.0.0.1:9001/ws_echo");
   if (r.net_err) {
     co_return;
@@ -218,7 +222,7 @@ asio::awaitable<void> static_file_server() {
   coro_http_server server(1, 9001);
 
   std::string virtual_path = "download";
-  std::string files_root_path = "";  // current path
+  std::string files_root_path = "./";  // current path
   server.set_static_res_dir(
       virtual_path,
       files_root_path);  // set this before server start, if you add new files,
@@ -226,7 +230,7 @@ asio::awaitable<void> static_file_server() {
   server.async_start();
   std::this_thread::sleep_for(300ms);  // wait for server start
 
-  coro_http_client client{};
+  coro_http_client client{co_await asio::this_coro::executor};
   auto result =
       co_await client.async_get("http://127.0.0.1:9001/download/temp.txt");
   assert(result.status == 200);
@@ -267,7 +271,7 @@ asio::awaitable<void> use_aspects() {
   server.async_start();
   std::this_thread::sleep_for(300ms);  // wait for server start
 
-  coro_http_client client{};
+  coro_http_client client{co_await asio::this_coro::executor};
   auto result = co_await client.async_get("http://127.0.0.1:9001/get");
   assert(result.status == 200);
 
@@ -313,7 +317,8 @@ asio::awaitable<void> basic_usage() {
           std::cout << part_head.name << "\n";
           std::cout << part_head.filename << "\n";  // if form data, no filename
 
-          auto part_body = co_await multipart.read_part_body(boundary);
+          auto part_body =
+              co_await multipart.read_part_body(std::string(boundary));
           if (part_body.ec) {
             co_return;
           }
@@ -333,10 +338,10 @@ asio::awaitable<void> basic_usage() {
       [](coro_http_request &req,
          coro_http_response &resp) -> asio::awaitable<void> {
         // will respose in another thread.
-        co_await coro_io::post([&] {
-          // do your heavy work here when finished work, response.
-          resp.set_status_and_content(status_type::ok, "ok");
-        });
+        co_await asio::post(co_await asio::this_coro::executor,
+                            asio::use_awaitable);
+        // do your heavy work here when finished work, response.
+        resp.set_status_and_content(status_type::ok, "ok");
       });
 
   server.set_http_handler<POST, PUT>(
@@ -377,7 +382,7 @@ asio::awaitable<void> basic_usage() {
   server.async_start();
   std::this_thread::sleep_for(300ms);  // wait for server start
 
-  coro_http_client client{};
+  coro_http_client client{co_await asio::this_coro::executor};
   auto result = co_await client.async_get("http://127.0.0.1:9001/get");
   assert(result.status == 200);
   assert(result.resp_body == "ok");
@@ -435,7 +440,8 @@ asio::awaitable<void> use_channel() {
 
   auto channel = std::make_shared<coro_io::load_blancer<coro_http_client>>(
       coro_io::load_blancer<coro_http_client>::create(
-          {"127.0.0.1:9001"}, {.lba = coro_io::load_blance_algorithm::random}));
+          co_await asio::this_coro::executor, {"127.0.0.1:9001"},
+          {.lba = coro_io::load_blance_algorithm::random}));
   std::string url = "http://127.0.0.1:9001/";
   co_await channel->send_request(
       [&url](coro_http_client &client,
@@ -456,23 +462,25 @@ asio::awaitable<void> use_pool() {
 
   std::string url = "http://127.0.0.1:9001/";
 
+  asio::thread_pool tp_pool(std::thread::hardware_concurrency() * 2);
   auto pool = coro_io::client_pool<coro_http_client>::create(
-      url, {std::thread::hardware_concurrency() * 2});
+      tp_pool.get_executor(), url, {std::thread::hardware_concurrency() * 2});
 
   std::atomic<size_t> count = 0;
   for (size_t i = 0; i < 10000; i++) {
-    pool->send_request(
-            [&](coro_http_client &client) -> asio::awaitable<void> {
-              auto data = co_await client.async_get(url);
-              std::cout << data.resp_body << "\n";
-            })
-        .start([&](auto &&) {
+    auto task = pool->send_request(
+        [&](coro_http_client &client) -> asio::awaitable<void> {
+          auto data = co_await client.async_get(url);
+          std::cout << data.resp_body << "\n";
           count++;
         });
+    asio::co_spawn(tp_pool, std::move(task), asio::detached);
   }
 
   while (count != 10000) {
-    std::this_thread::sleep_for(5ms);
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(5ms);
+    co_await timer.async_wait(asio::use_awaitable);
   }
 
   int size = pool->free_client_count();
@@ -480,14 +488,22 @@ asio::awaitable<void> use_pool() {
   co_return;
 }
 
+asio::awaitable<void> co_main() {
+  co_await use_channel();
+  //co_await use_pool();
+  co_await basic_usage();
+  co_await use_aspects();
+  co_await static_file_server();
+  co_await use_websocket();
+  co_await chunked_upload_download();
+  co_await byte_ranges_download();
+}
+
 int main() {
-  async_simple::coro::syncAwait(use_channel());
-  async_simple::coro::syncAwait(use_pool());
-  async_simple::coro::syncAwait(basic_usage());
-  async_simple::coro::syncAwait(use_aspects());
-  async_simple::coro::syncAwait(static_file_server());
-  async_simple::coro::syncAwait(use_websocket());
-  async_simple::coro::syncAwait(chunked_upload_download());
-  async_simple::coro::syncAwait(byte_ranges_download());
-  return 0;
+  asio::io_context ioc;
+  asio::co_spawn(ioc, co_main(), [](std::exception_ptr e) {
+    if (e)
+      std::rethrow_exception(e);
+  });
+  return ioc.run();
 }

@@ -7,9 +7,7 @@
 #include "cinatra/mime_types.hpp"
 #include "cinatra_log_wrapper.hpp"
 #include "coro_http_connection.hpp"
-#include "ylt/coro_io/coro_file.hpp"
 #include "ylt/coro_io/coro_io.hpp"
-#include "ylt/coro_io/io_context_pool.hpp"
 #include "ylt/coro_io/load_blancer.hpp"
 
 namespace cinatra {
@@ -21,33 +19,30 @@ class coro_http_server {
  public:
   coro_http_server(asio::io_context &ctx, unsigned short port,
                    std::string address = "0.0.0.0")
-      : out_ctx_(&ctx), port_(port), acceptor_(ctx), check_timer_(ctx) {
+      : port_(port), acceptor_(ctx), check_timer_(ctx) {
     init_address(std::move(address));
   }
 
   coro_http_server(asio::io_context &ctx,
                    std::string address /* = "0.0.0.0:9001" */)
-      : out_ctx_(&ctx), acceptor_(ctx), check_timer_(ctx) {
+      : acceptor_(ctx), check_timer_(ctx) {
     init_address(std::move(address));
   }
 
   coro_http_server(size_t thread_num, unsigned short port,
-                   std::string address = "0.0.0.0", bool cpu_affinity = false)
-      : pool_(std::make_unique<coro_io::io_context_pool>(thread_num,
-                                                         cpu_affinity)),
+                   std::string address = "0.0.0.0")
+      : pool_(std::make_unique<asio::thread_pool>(thread_num)),
         port_(port),
-        acceptor_(pool_->get_executor()->get_asio_executor()),
-        check_timer_(pool_->get_executor()->get_asio_executor()) {
+        acceptor_(*pool_),
+        check_timer_(*pool_) {
     init_address(std::move(address));
   }
 
   coro_http_server(size_t thread_num,
-                   std::string address /* = "0.0.0.0:9001" */,
-                   bool cpu_affinity = false)
-      : pool_(std::make_unique<coro_io::io_context_pool>(thread_num,
-                                                         cpu_affinity)),
-        acceptor_(pool_->get_executor()->get_asio_executor()),
-        check_timer_(pool_->get_executor()->get_asio_executor()) {
+                   std::string address /* = "0.0.0.0:9001" */)
+      : pool_(std::make_unique<asio::thread_pool>(thread_num)),
+        acceptor_(*pool_),
+        check_timer_(*pool_) {
     init_address(std::move(address));
   }
 
@@ -76,46 +71,35 @@ class coro_http_server {
   std::error_code sync_start() noexcept {
     auto ret = async_start();
     ret.wait();
-    return ret.value();
+    return ret.get();
   }
 
   // only call once, not thread safe.
-  async_simple::Future<std::error_code> async_start() {
+  std::future<std::error_code> async_start() {
     errc_ = listen();
 
-    async_simple::Promise<std::error_code> promise;
-    auto future = promise.getFuture();
+    std::promise<std::error_code> promise;
+    auto future = promise.get_future();
 
-    if (!errc_) {
-      if (out_ctx_ == nullptr) {
-        thd_ = std::thread([this] {
-          pool_->run();
-        });
-      }
-
-      accept().start([p = std::move(promise), this](auto &&res) mutable {
-        if (res.hasError()) {
-          errc_ = std::make_error_code(std::errc::io_error);
-          p.setValue(errc_);
-        }
-        else {
-          p.setValue(res.value());
-        }
-      });
-    }
-    else {
-      promise.setValue(errc_);
+    if (errc_) {
+      promise.set_value(errc_);
+      return future;
     }
 
-    return future;
+    asio::co_spawn(
+        *pool_,
+        [this]() -> asio::awaitable<void> {
+          while (!co_await coro_io::sleep_for(check_session_duration_)) {
+            session_manager::get().remove_expire_session();
+          }
+        },
+        asio::detached);
+
+    return asio::co_spawn(*pool_, accept(), asio::use_future);
   }
 
   // only call once, not thread safe.
   void stop() {
-    if (out_ctx_ == nullptr && !thd_.joinable()) {
-      return;
-    }
-
     stop_timer_ = true;
     std::error_code ec;
     check_timer_.cancel(ec);
@@ -130,18 +114,8 @@ class coro_http_server {
       }
       connections_.clear();
     }
-
-    if (out_ctx_ == nullptr) {
-      CINATRA_LOG_INFO << "wait for server's thread-pool finish all work.";
-      pool_->stop();
-
-      CINATRA_LOG_INFO << "server's thread-pool finished.";
-      thd_.join();
-      CINATRA_LOG_INFO << "stop coro_http_server ok";
-    }
-    else {
-      out_ctx_ = nullptr;
-    }
+    pool_->stop();
+    pool_->wait();
   }
 
   // call it after server async_start or sync_start.
@@ -170,7 +144,7 @@ class coro_http_server {
     using return_type = typename util::function_traits<Func>::return_type;
     if constexpr (coro_io::is_lazy_v<return_type>) {
       std::function<asio::awaitable<void>(coro_http_request & req,
-                                                   coro_http_response & resp)>
+                                          coro_http_response & resp)>
           f = std::bind(handler, &owner, std::placeholders::_1,
                         std::placeholders::_2);
       set_http_handler<method...>(std::move(key), std::move(f),
@@ -200,10 +174,9 @@ class coro_http_server {
         std::make_shared<coro_io::load_blancer<coro_http_client>>(
             coro_io::load_blancer<coro_http_client>::create(
                 hosts, {.lba = type}, weights));
-    auto handler =
-        [this, load_blancer, type](
-            coro_http_request &req,
-            coro_http_response &response) -> asio::awaitable<void> {
+    auto handler = [this, load_blancer, type](
+                       coro_http_request &req,
+                       coro_http_response &response) -> asio::awaitable<void> {
       co_await load_blancer->send_request(
           [this, &req, &response](
               coro_http_client &client,
@@ -243,8 +216,8 @@ class coro_http_server {
 
     set_http_handler<cinatra::GET>(
         url_path,
-        [load_blancer](coro_http_request &req, coro_http_response &resp)
-            -> asio::awaitable<void> {
+        [load_blancer](coro_http_request &req,
+                       coro_http_response &resp) -> asio::awaitable<void> {
           websocket_result result{};
           while (true) {
             result = co_await req.get_conn()->read_websocket();
@@ -258,8 +231,9 @@ class coro_http_server {
             }
 
             auto ret = co_await load_blancer->send_request(
-                [&req, result](coro_http_client &client, std::string_view host)
-                    -> asio::awaitable<std::error_code> {
+                [&req, result](
+                    coro_http_client &client,
+                    std::string_view host) -> asio::awaitable<std::error_code> {
                   auto r =
                       co_await client.write_websocket(std::string(result.data));
                   if (r.net_err) {
@@ -404,15 +378,18 @@ class coro_http_server {
               std::string &body = it->second;
               std::array<asio::const_buffer, 2> arr{asio::buffer(range_header),
                                                     asio::buffer(body)};
-              co_await req.get_conn()->async_write(arr);
+              std::error_code ec;
+              co_await req.get_conn()->async_write(
+                  arr, asio::redirect_error(asio::use_awaitable, ec));
               co_return;
             }
 
             std::string content;
             detail::resize(content, chunked_size_);
 
-            coro_io::coro_file in_file{};
-            in_file.open(file_name, std::ios::in);
+            asio::stream_file in_file{co_await asio::this_coro::executor};
+            std::error_code ec;
+            in_file.open(file_name, asio::stream_file::read_only, ec);
             if (!in_file.is_open()) {
               resp.set_status_and_content(status_type::not_found,
                                           file_name + "not found");
@@ -430,8 +407,14 @@ class coro_http_server {
               }
 
               while (true) {
-                auto [ec, size] =
-                    co_await in_file.async_read(content.data(), content.size());
+                std::error_code ec;
+                auto size = co_await in_file.async_read_some(
+                    asio::buffer(content.data(), content.size()),
+                    asio::redirect_error(asio::use_awaitable, ec));
+                if (ec == asio::error::eof) {
+                  co_await resp.get_conn()->end_chunked();
+                  break;
+                }
                 if (ec) {
                   resp.set_status(status_type::no_content);
                   co_await resp.get_conn()->reply();
@@ -442,11 +425,6 @@ class coro_http_server {
                     std::string_view(content.data(), size));
                 if (!r) {
                   co_return;
-                }
-
-                if (in_file.eof()) {
-                  co_await resp.get_conn()->end_chunked();
-                  break;
                 }
               }
             }
@@ -467,7 +445,7 @@ class coro_http_server {
                 if (ranges.size() == 1) {
                   // single part
                   auto [start, end] = ranges[0];
-                  in_file.seek(start, std::ios::beg);
+                  in_file.seek(start, asio::stream_file::seek_set);
                   size_t part_size = end + 1 - start;
                   int status = (part_size == file_size) ? 200 : 206;
                   std::string content_range = "Content-Range: bytes ";
@@ -510,8 +488,9 @@ class coro_http_server {
                     }
 
                     auto [start, end] = ranges[i];
-                    bool ok = in_file.seek(start, std::ios::beg);
-                    if (!ok) {
+                    std::error_code ec;
+                    in_file.seek(start, asio::stream_file::seek_set, ec);
+                    if (ec) {
                       resp.set_status_and_content(status_type::bad_request,
                                                   "invalid range");
                       co_await resp.get_conn()->reply();
@@ -542,8 +521,12 @@ class coro_http_server {
               }
 
               while (true) {
-                auto [ec, size] =
-                    co_await in_file.async_read(content.data(), content.size());
+                std::error_code ec;
+                auto size = co_await in_file.async_read_some(
+                    asio::buffer(content.data(), content.size()),
+                    asio::redirect_error(asio::use_awaitable, ec));
+                if (ec == asio::error::eof)
+                  break;
                 if (ec) {
                   resp.set_status(status_type::no_content);
                   co_await resp.get_conn()->reply();
@@ -554,10 +537,6 @@ class coro_http_server {
                     std::string_view(content.data(), size));
                 if (!r) {
                   co_return;
-                }
-
-                if (in_file.eof()) {
-                  break;
                 }
               }
             }
@@ -654,19 +633,12 @@ class coro_http_server {
   }
 
   asio::awaitable<std::error_code> accept() {
+    std::error_code error;
+    auto executor = co_await asio::this_coro::executor;
     for (;;) {
-      coro_io::ExecutorWrapper<> *executor;
-      if (out_ctx_ == nullptr) {
-        executor = pool_->get_executor();
-      }
-      else {
-        out_executor_ = std::make_unique<coro_io::ExecutorWrapper<>>(
-            out_ctx_->get_executor());
-        executor = out_executor_.get();
-      }
-
-      asio::ip::tcp::socket socket(executor->get_asio_executor());
-      auto error = co_await coro_io::async_accept(acceptor_, socket);
+      asio::ip::tcp::socket socket(executor);
+      co_await acceptor_.async_accept(
+          socket, asio::redirect_error(asio::use_awaitable, error));
       if (error) {
         CINATRA_LOG_INFO << "accept failed, error: " << error.message();
         if (error == asio::error::operation_aborted ||
@@ -723,13 +695,13 @@ class coro_http_server {
         connections_.emplace(conn_id, conn);
       }
 
-      start_one(conn).via(conn->get_executor()).detach();
+      asio::co_spawn(
+          executor,
+          [conn]() -> asio::awaitable<void> {
+            co_await conn->start();
+          },
+          asio::detached);
     }
-  }
-
-  asio::awaitable<void> start_one(
-      std::shared_ptr<coro_http_connection> conn) noexcept {
-    co_await conn->start();
   }
 
   void close_acceptor() {
@@ -830,15 +802,18 @@ class coro_http_server {
   }
 
   asio::awaitable<bool> send_single_part(auto &in_file, auto &content,
-                                                  auto &req, auto &resp,
-                                                  size_t part_size,
-                                                  std::string_view more = "") {
+                                         auto &req, auto &resp,
+                                         size_t part_size,
+                                         std::string_view more = "") {
     while (true) {
       size_t read_size = (std::min)(part_size, chunked_size_);
       if (read_size == 0) {
         break;
       }
-      auto [ec, size] = co_await in_file.async_read(content.data(), read_size);
+      std::error_code ec;
+      auto size = co_await in_file.async_read_some(
+          asio::buffer(content.data(), read_size),
+          asio::redirect_error(asio::use_awaitable, ec));
       if (ec) {
         resp.set_status(status_type::no_content);
         co_await resp.get_conn()->reply();
@@ -855,7 +830,8 @@ class coro_http_server {
       else {
         std::array<asio::const_buffer, 2> arr{
             asio::buffer(content.data(), size), asio::buffer(more)};
-        auto [ec, _] = co_await req.get_conn()->async_write(arr);
+        co_await req.get_conn()->async_write(
+            arr, asio::redirect_error(asio::use_awaitable, ec));
         if (ec) {
           r = false;
         }
@@ -906,10 +882,9 @@ class coro_http_server {
     }
   }
 
-  asio::awaitable<void> reply(coro_http_client &client,
-                                       std::string_view host,
-                                       coro_http_request &req,
-                                       coro_http_response &response) {
+  asio::awaitable<void> reply(coro_http_client &client, std::string_view host,
+                              coro_http_request &req,
+                              coro_http_response &response) {
     uri_t uri;
     std::string proxy_host;
 
@@ -964,16 +939,16 @@ class coro_http_server {
 
     address_ = std::move(address);
   }
+  void set_check_session_duration(auto duration) {
+    check_session_duration_ = duration;
+  }
 
  private:
-  std::unique_ptr<coro_io::io_context_pool> pool_;
-  asio::io_context *out_ctx_ = nullptr;
-  std::unique_ptr<coro_io::ExecutorWrapper<>> out_executor_ = nullptr;
+  std::unique_ptr<asio::thread_pool> pool_;
   uint16_t port_;
   std::string address_;
   std::error_code errc_ = {};
   asio::ip::tcp::acceptor acceptor_;
-  std::thread thd_;
   std::promise<void> acceptor_close_waiter_;
   bool no_delay_ = true;
 
@@ -1004,13 +979,15 @@ class coro_http_server {
   coro_http_router router_;
   bool need_shrink_every_time_ = false;
   std::function<asio::awaitable<void>(coro_http_request &,
-                                               coro_http_response &)>
+                                      coro_http_response &)>
       default_handler_ = nullptr;
   int64_t max_http_body_len_ = MAX_HTTP_BODY_SIZE;
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
   bool write_failed_forever_ = false;
   bool read_failed_forever_ = false;
 #endif
+  std::chrono::steady_clock::duration check_session_duration_ =
+      std::chrono::seconds(15);
 };
 
 using http_server = coro_http_server;

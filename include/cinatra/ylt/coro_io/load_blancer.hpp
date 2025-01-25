@@ -22,7 +22,6 @@
 #include <random>
 
 #include "client_pool.hpp"
-#include "io_context_pool.hpp"
 namespace coro_io {
 
 enum class load_blance_algorithm {
@@ -31,10 +30,10 @@ enum class load_blance_algorithm {
   random,
 };
 
-template <typename client_t, typename io_context_pool_t = io_context_pool>
+template <typename client_t>
 class load_blancer {
-  using client_pool_t = client_pool<client_t, io_context_pool_t>;
-  using client_pools_t = client_pools<client_t, io_context_pool_t>;
+  using client_pool_t = client_pool<client_t>;
+  using client_pools_t = client_pools<client_t>;
 
  public:
   struct load_blancer_config {
@@ -47,7 +46,7 @@ class load_blancer {
   struct RRLoadBlancer {
     std::unique_ptr<std::atomic<uint32_t>> index =
         std::make_unique<std::atomic<uint32_t>>();
-    async_simple::coro::Lazy<std::shared_ptr<client_pool_t>> operator()(
+    asio::awaitable<std::shared_ptr<client_pool_t>> operator()(
         const load_blancer& load_blancer) {
       auto i = index->fetch_add(1, std::memory_order_relaxed);
       co_return load_blancer
@@ -84,7 +83,7 @@ class load_blancer {
       max_weight_ = get_max_weight();
     }
 
-    async_simple::coro::Lazy<std::shared_ptr<client_pool_t>> operator()(
+    asio::awaitable<std::shared_ptr<client_pool_t>> operator()(
         const load_blancer& load_blancer) {
       int selected = select_host_with_weight_round_robin();
       if (selected == -1) {
@@ -139,7 +138,7 @@ class load_blancer {
   };
 
   struct RandomLoadBlancer {
-    async_simple::coro::Lazy<std::shared_ptr<client_pool_t>> operator()(
+    asio::awaitable<std::shared_ptr<client_pool_t>> operator()(
         const load_blancer& load_blancer) {
       static thread_local std::default_random_engine e(std::time(nullptr));
       std::uniform_int_distribution rnd{std::size_t{0},
@@ -189,13 +188,12 @@ class load_blancer {
   }
 
   static load_blancer create(
+      const asio::any_io_executor& executor,
       const std::vector<std::string_view>& hosts,
       const load_blancer_config& config = {},
-      const std::vector<int>& weights = {},
-      client_pools_t& client_pools =
-          g_clients_pool<client_t, io_context_pool_t>()) {
+      const std::vector<int>& weights = {}) {
     load_blancer ch;
-    ch.init(hosts, config, weights, client_pools);
+    ch.init(hosts, config, weights, g_clients_pool<client_t>(executor));
     return ch;
   }
 

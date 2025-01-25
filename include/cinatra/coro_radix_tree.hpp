@@ -23,7 +23,7 @@ typedef std::tuple<
     parse_result;
 
 typedef std::tuple<bool,
-                   std::function<async_simple::coro::Lazy<void>(
+                   std::function<asio::awaitable<void>(
                        coro_http_request &req, coro_http_response &resp)>,
                    std::unordered_map<std::string, std::string>>
     coro_result;
@@ -35,7 +35,7 @@ struct handler_t {
 
 struct coro_handler_t {
   std::string method;
-  std::function<async_simple::coro::Lazy<void>(coro_http_request &req,
+  std::function<asio::awaitable<void>(coro_http_request &req,
                                                coro_http_response &resp)>
       coro_handler;
 };
@@ -61,7 +61,7 @@ struct radix_tree_node {
     return nullptr;
   }
 
-  std::function<async_simple::coro::Lazy<void>(coro_http_request &req,
+  std::function<asio::awaitable<void>(coro_http_request &req,
                                                coro_http_response &resp)>
   get_coro_handler(const std::string &method) {
     if (coro_handler.method == method) {
@@ -79,7 +79,7 @@ struct radix_tree_node {
     return 0;
   }
 
-  int add_coro_handler(std::function<async_simple::coro::Lazy<void>(
+  int add_coro_handler(std::function<asio::awaitable<void>(
                            coro_http_request &req, coro_http_response &resp)>
                            coro_handler,
                        const std::string &method) {
@@ -224,7 +224,7 @@ class radix_tree {
   }
 
   int coro_insert(const std::string &path,
-                  std::function<async_simple::coro::Lazy<void>(
+                  std::function<asio::awaitable<void>(
                       coro_http_request &req, coro_http_response &resp)>
                       coro_handler,
                   std::string &method) {

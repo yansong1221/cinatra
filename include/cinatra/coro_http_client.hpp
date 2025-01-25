@@ -41,7 +41,7 @@
 #include "websocket.hpp"
 
 namespace coro_io {
-template <typename T, typename U>
+template <typename T>
 class client_pool;
 }
 namespace cinatra {
@@ -357,10 +357,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         data.status = 200;
       }
       co_return true;
-    }();
-    co_await std::move(connect_function);
-    auto result = co_await exec_with_timeout(std::move(connect_function),
-                                             conn_timeout_duration_);
+    };
+    auto result =
+        co_await exec_with_timeout(connect_function(), conn_timeout_duration_);
     if (!result) {
       co_return resp_data{std::make_error_code(std::errc::timed_out), 404};
     }
@@ -661,10 +660,15 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
                                             std::string filename,
                                             std::string range = "") {
     resp_data data{};
+    std::error_code ec;
     auto file =
         std::make_shared<asio::stream_file>(co_await asio::this_coro::executor);
     file->open(filename,
-               asio::stream_file::truncate | asio::stream_file::write_only);
+               asio::stream_file::truncate | asio::stream_file::write_only |
+                   asio::stream_file::create,
+        ec);
+    if (ec)
+      CINATRA_LOG_WARNING << ec.message();
     if (!file->is_open()) {
       data.net_err = std::make_error_code(std::errc::no_such_file_or_directory);
       data.status = 404;
@@ -760,7 +764,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       std::vector<asio::const_buffer> bufs;
       std::string size_str;
       cinatra::to_chunked_buffers(bufs, size_str, {file_data.data(), rd_size},
-                                  rd_size == 0);
+                                  ec == asio::error::eof);
       auto size = co_await async_write(
           bufs, asio::redirect_error(asio::use_awaitable, ec));
       if (ec) {
@@ -778,26 +782,25 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
     std::string file_data;
     detail::resize(file_data, (std::min)(max_single_part_size_, length));
-    asio::random_access_file file{co_await asio::this_coro::executor};
+    asio::stream_file file{co_await asio::this_coro::executor};
     file.open(source, asio::random_access_file::read_only);
     if (!file.is_open()) {
       ec = std::make_error_code(std::errc::bad_file_descriptor);
       co_return;
     }
-
+    file.seek(offset, asio::stream_file::file_base::seek_set);
     while (length > 0) {
       std::error_code ec;
-      auto size = co_await file.async_read_some_at(
-          offset, asio::buffer(file_data, std::min(length, file_data.size())),
+      auto size = co_await file.async_read_some(
+          asio::buffer(file_data, std::min(length, file_data.size())),
           asio::redirect_error(asio::use_awaitable, ec));
 
       if (ec) {
         // bad request, file may smaller than content-length
         break;
       }
-      offset += size;
       length -= size;
-      if (length > 0 && size == 0) {
+      if (length > 0 && ec == asio::error::eof) {
         // bad request, file may smaller than content-length
         ec = std::make_error_code(std::errc::invalid_argument);
         break;
@@ -1014,7 +1017,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       std::string size_str;
       cinatra::to_chunked_buffers(bufs, size_str, {file_data.data(), rd_size},
                                   source->eof());
-      if (std::tie(ec, size) = co_await async_write(bufs); ec) {
+      size = co_await async_write(
+          bufs, asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
     }
@@ -1036,9 +1041,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
               ->read(file_data.data(),
                      std::min<size_t>(content_length, file_data.size()))
               .gcount();
-      if (std::tie(ec, size) =
-              co_await async_write(asio::buffer(file_data.data(), rd_size));
-          ec) {
+      size =
+          co_await async_write(asio::buffer(file_data.data(), rd_size),
+                               asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
       content_length -= rd_size;
@@ -1059,7 +1065,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       std::string size_str;
       cinatra::to_chunked_buffers(
           bufs, size_str, {result.buf.data(), result.buf.size()}, result.eof);
-      if (std::tie(ec, size) = co_await async_write(bufs); ec) {
+      size = co_await async_write(
+          bufs, asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
       if (result.eof) {
@@ -1075,10 +1083,12 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     size_t size = 0;
     while (true) {
       auto result = co_await source();
-      if (std::tie(ec, size) = co_await async_write(asio::buffer(
+      size = co_await async_write(
+          asio::buffer(
               result.buf.data(),
-              std::min<std::size_t>(content_length, result.buf.size())));
-          ec) {
+              std::min<std::size_t>(content_length, result.buf.size())),
+          asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         break;
       }
       content_length -= size;
@@ -1409,10 +1419,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         data = co_await handle_read(ec, size, is_keep_alive, std::move(ctx),
                                     method);
         co_return true;
-      }();
+      };
 
-      auto result = co_await exec_with_timeout(std::move(exec_function),
-                                               req_timeout_duration_);
+      auto result =
+          co_await exec_with_timeout(exec_function(), req_timeout_duration_);
       if (!result) {
         data = resp_data{std::make_error_code(std::errc::timed_out), 404};
       }
@@ -1523,7 +1533,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
   void enable_sni_hostname(bool r) { need_set_sni_host_ = r; }
 #endif
 
-  template <typename T, typename U>
+  template <typename T>
   friend class coro_io::client_pool;
 
  private:
@@ -2182,21 +2192,20 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         auto rd_size = co_await file.async_read_some(
             asio::buffer(file_data),
             asio::redirect_error(asio::use_awaitable, rd_ec));
+        if (rd_ec == asio::error::eof) {
+          auto size = co_await async_write(
+              asio::buffer(CRCF),
+              asio::redirect_error(asio::use_awaitable, rd_ec));
+          if (rd_ec)
+            co_return resp_data{ec, 404};
+
+          break;
+        }
 
         co_await async_write(asio::buffer(file_data.data(), rd_size),
                              asio::redirect_error(asio::use_awaitable, rd_ec));
         if (rd_ec)
           co_return resp_data{ec, 404};
-
-        if (rd_size == 0) {
-          auto size = co_await async_write(
-              asio::buffer(CRCF),
-              asio::redirect_error(asio::use_awaitable, rd_ec));
-          if (ec)
-            co_return resp_data{ec, 404};
-
-          break;
-        }
       }
     }
     else {

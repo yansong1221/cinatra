@@ -15,14 +15,6 @@
  */
 #pragma once
 
-#include <async_simple/Executor.h>
-#include <async_simple/Promise.h>
-#include <async_simple/Try.h>
-#include <async_simple/Unit.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/Sleep.h>
-#include <async_simple/coro/SpinLock.h>
-
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 #include <atomic>
@@ -46,22 +38,19 @@
 #include "async_simple/coro/Collect.h"
 #include "coro_io.hpp"
 #include "detail/client_queue.hpp"
-#include "io_context_pool.hpp"
 
 namespace coro_io {
 
-template <typename client_t, typename io_context_pool_t>
+template <typename client_t>
 class client_pools;
 
-template <typename, typename>
+template <typename client_t>
 class load_blancer;
 
-template <typename client_t,
-          typename io_context_pool_t = coro_io::io_context_pool>
-class client_pool : public std::enable_shared_from_this<
-                        client_pool<client_t, io_context_pool_t>> {
-  using client_pools_t = client_pools<client_t, io_context_pool_t>;
-  static async_simple::coro::Lazy<void> collect_idle_timeout_client(
+template <typename client_t>
+class client_pool : public std::enable_shared_from_this<client_pool<client_t>> {
+  using client_pools_t = client_pools<client_t>;
+  static asio::awaitable<void> collect_idle_timeout_client(
       std::weak_ptr<client_pool> self_weak,
       coro_io::detail::client_queue<std::unique_ptr<client_t>>& clients,
       std::chrono::milliseconds sleep_time, std::size_t clear_cnt) {
@@ -72,7 +61,13 @@ class client_pool : public std::enable_shared_from_this<
     while (true) {
       clients.reselect();
       self = nullptr;
-      co_await coro_io::sleep_for(sleep_time);
+
+       asio::steady_timer timer(co_await asio::this_coro::executor);
+      timer.expires_after(sleep_time);
+      std::error_code ec;
+      co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      if (ec)
+        co_return;
       if ((self = self_weak.lock()) == nullptr) {
         break;
       }
@@ -85,11 +80,11 @@ class client_pool : public std::enable_shared_from_this<
                           << self->host_name_
                           << "}, now client cnt: " << clients.size();
         if (is_all_cleared != 0) [[unlikely]] {
-          try {
+          /*try {
             co_await async_simple::coro::Yield{};
           } catch (std::exception& e) {
             CINATRA_LOG_ERROR << "unexcepted yield exception: " << e.what();
-          }
+          }*/
         }
         else {
           break;
@@ -112,7 +107,7 @@ class client_pool : public std::enable_shared_from_this<
     return std::chrono::milliseconds{static_cast<long>(e(r) * ms.count())};
   }
 
-  static async_simple::coro::Lazy<std::pair<bool, std::chrono::milliseconds>>
+  static asio::awaitable<std::pair<bool, std::chrono::milliseconds>>
   reconnect_impl(std::unique_ptr<client_t>& client,
                  std::shared_ptr<client_pool>& self) {
     auto pre_time_point = std::chrono::steady_clock::now();
@@ -126,8 +121,8 @@ class client_pool : public std::enable_shared_from_this<
     co_return std::pair{ok, cost_time};
   }
 
-  static async_simple::coro::Lazy<void> reconnect(
-      std::unique_ptr<client_t>& client, std::weak_ptr<client_pool> watcher) {
+  static asio::awaitable<void> reconnect(std::unique_ptr<client_t>& client,
+                                         std::weak_ptr<client_pool> watcher) {
     using namespace std::chrono_literals;
     std::shared_ptr<client_pool> self = watcher.lock();
     uint32_t i = UINT32_MAX;  // (at least connect once)
@@ -148,20 +143,29 @@ class client_pool : public std::enable_shared_from_this<
       auto wait_time = rand_time(
           (self->pool_config_.reconnect_wait_time - cost_time) / 1ms * 1ms);
       self = nullptr;
-      if (wait_time.count() > 0)
-        co_await coro_io::sleep_for(wait_time, &client->get_executor());
+      if (wait_time.count() > 0) {
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(wait_time);
+        std::error_code ec;
+        co_await timer.async_wait(
+            asio::redirect_error(asio::use_awaitable, ec));
+        if (ec)
+          co_return;
+      }
       self = watcher.lock();
       ++i;
     } while (i < self->pool_config_.connect_retry_count);
     CINATRA_LOG_WARNING << "reconnect client{" << client.get() << "},host:{"
                         << client->get_host() << ":" << client->get_port()
                         << "} out of max limit, stop retry. connect failed";
-    alive_detect(client->get_config(), std::move(self)).start([](auto&&) {
-    });
+
+    asio::co_spawn(co_await asio::this_coro::executor,
+                   alive_detect(client->get_config(), std::move(self)),
+                   asio::detached);
     client = nullptr;
   }
 
-  static async_simple::coro::Lazy<void> alive_detect(
+  static asio::awaitable<void> alive_detect(
       const typename client_t::config& client_config,
       std::weak_ptr<client_pool> watcher) {
     std::shared_ptr<client_pool> self = watcher.lock();
@@ -177,8 +181,8 @@ class client_pool : public std::enable_shared_from_this<
         self->is_alive_ = true;
         co_return;
       }
-      auto executor = self->io_context_pool_.get_executor();
-      auto client = std::make_unique<client_t>(*executor);
+      auto client =
+          std::make_unique<client_t>(co_await asio::this_coro::executor);
       if (!client->init_config(client_config))
         AS_UNLIKELY {
           CINATRA_LOG_ERROR
@@ -208,7 +212,13 @@ class client_pool : public std::enable_shared_from_this<
             1ms);
         self = nullptr;
         if (wait_time.count() > 0) {
-          co_await coro_io::sleep_for(wait_time, &client->get_executor());
+          asio::steady_timer timer(co_await asio::this_coro::executor);
+          timer.expires_after(wait_time);
+          std::error_code ec;
+          co_await timer.async_wait(
+              asio::redirect_error(asio::use_awaitable, ec));
+          if (ec)
+            co_return;
         }
         self = watcher.lock();
         if (self->is_alive_) {
@@ -220,7 +230,7 @@ class client_pool : public std::enable_shared_from_this<
     }
   }
 
-  async_simple::coro::Lazy<std::unique_ptr<client_t>> get_client(
+  asio::awaitable<std::unique_ptr<client_t>> get_client(
       const typename client_t::config& client_config) {
     std::unique_ptr<client_t> client;
     free_clients_.try_dequeue(client);
@@ -229,8 +239,7 @@ class client_pool : public std::enable_shared_from_this<
     }
     if (client == nullptr) {
       std::unique_ptr<client_t> cli;
-      auto executor = io_context_pool_.get_executor();
-      client = std::make_unique<client_t>(*executor);
+      client = std::make_unique<client_t>(io_context_pool_);
       if (!client->init_config(client_config))
         AS_UNLIKELY {
           CINATRA_LOG_ERROR << "init client config failed.";
@@ -254,13 +263,14 @@ class client_pool : public std::enable_shared_from_this<
       if (clients.collecter_cnt_.compare_exchange_strong(expected, 1)) {
         CINATRA_LOG_TRACE << "start timeout client collecter of client_pool{"
                           << host_name_ << "}";
-        collect_idle_timeout_client(
-            this->weak_from_this(), clients,
-            (std::max)(collect_time, std::chrono::milliseconds{50}),
-            pool_config_.idle_queue_per_max_clear_count)
-            .via(coro_io::get_global_executor())
-            .start([](auto&&) {
-            });
+
+        asio::co_spawn(
+            io_context_pool_,
+            collect_idle_timeout_client(
+                this->weak_from_this(), clients,
+                (std::max)(collect_time, std::chrono::milliseconds{50}),
+                pool_config_.idle_queue_per_max_clear_count),
+            asio::detached);
       }
     }
   }
@@ -295,7 +305,7 @@ class client_pool : public std::enable_shared_from_this<
     using type = void;
   };
   template <typename T>
-  struct lazy_hacker<async_simple::coro::Lazy<T>> {
+  struct lazy_hacker<asio::awaitable<T>> {
     using type = T;
   };
   template <typename T>
@@ -328,15 +338,15 @@ class client_pool : public std::enable_shared_from_this<
 
  public:
   static std::shared_ptr<client_pool> create(
-      std::string_view host_name, const pool_config& pool_config = {},
-      io_context_pool_t& io_context_pool = coro_io::g_io_context_pool()) {
+      const asio::any_io_executor& io_context_pool, std::string_view host_name,
+      const pool_config& pool_config = {}) {
     return std::make_shared<client_pool>(private_construct_token{}, host_name,
                                          pool_config, io_context_pool);
   }
 
   client_pool(private_construct_token t, std::string_view host_name,
               const pool_config& pool_config,
-              io_context_pool_t& io_context_pool)
+              const asio::any_io_executor& io_context_pool)
       : host_name_(host_name),
         pool_config_(pool_config),
         io_context_pool_(io_context_pool),
@@ -344,7 +354,7 @@ class client_pool : public std::enable_shared_from_this<
 
   client_pool(private_construct_token t, client_pools_t* pools_manager_,
               std::string_view host_name, const pool_config& pool_config,
-              io_context_pool_t& io_context_pool)
+              const asio::any_io_executor& io_context_pool)
       : pools_manager_(pools_manager_),
         host_name_(host_name),
         pool_config_(pool_config),
@@ -352,7 +362,7 @@ class client_pool : public std::enable_shared_from_this<
         free_clients_(pool_config.max_connection){};
 
   template <typename T>
-  async_simple::coro::Lazy<return_type<T>> send_request(
+  asio::awaitable<return_type<T>> send_request(
       T op, typename client_t::config& client_config) {
     // return type: Lazy<expected<T::returnType,std::errc>>
     CINATRA_LOG_TRACE << "try send request to " << host_name_;
@@ -404,14 +414,14 @@ class client_pool : public std::enable_shared_from_this<
   std::string_view get_host_name() const noexcept { return host_name_; }
 
  private:
-  template <typename, typename>
+  template <typename T>
   friend class client_pools;
 
-  template <typename, typename>
+  template <typename T>
   friend class load_blancer;
 
   template <typename T>
-  async_simple::coro::Lazy<return_type_with_host<T>> send_request(
+  asio::awaitable<return_type_with_host<T>> send_request(
       T op, std::string_view endpoint,
       typename client_t::config& client_config) {
     // return type: Lazy<expected<T::returnType,std::errc>>
@@ -445,22 +455,19 @@ class client_pool : public std::enable_shared_from_this<
   coro_io::detail::client_queue<std::unique_ptr<client_t>>
       short_connect_clients_;
   client_pools_t* pools_manager_ = nullptr;
-  async_simple::Promise<async_simple::Unit> idle_timeout_waiter;
   std::string host_name_;
   pool_config pool_config_;
-  io_context_pool_t& io_context_pool_;
+  asio::any_io_executor io_context_pool_;
   std::atomic<bool> is_alive_ = true;
 };
 
-template <typename client_t,
-          typename io_context_pool_t = coro_io::io_context_pool>
+template <typename client_t>
 class client_pools {
-  using client_pool_t = client_pool<client_t, io_context_pool_t>;
+  using client_pool_t = client_pool<client_t>;
 
  public:
-  client_pools(
-      const typename client_pool_t::pool_config& pool_config = {},
-      io_context_pool_t& io_context_pool = coro_io::g_io_context_pool())
+  client_pools(const asio::any_io_executor& io_context_pool,
+               const typename client_pool_t::pool_config& pool_config = {})
       : io_context_pool_(io_context_pool), default_pool_config_(pool_config) {}
   auto send_request(std::string_view host_name, auto op)
       -> decltype(std::declval<client_pool_t>().send_request(std::move(op))) {
@@ -532,18 +539,15 @@ class client_pools {
   std::unordered_map<std::string, std::shared_ptr<client_pool_t>, string_hash,
                      std::equal_to<>>
       client_pool_manager_;
-  io_context_pool_t& io_context_pool_;
+  asio::any_io_executor io_context_pool_;
   std::shared_mutex mutex_;
 };
 
-template <typename client_t,
-          typename io_context_pool_t = coro_io::io_context_pool>
-inline client_pools<client_t, io_context_pool_t>& g_clients_pool(
-    const typename client_pool<client_t, io_context_pool_t>::pool_config&
-        pool_config = {},
-    io_context_pool_t& io_context_pool = coro_io::g_io_context_pool()) {
-  static client_pools<client_t, io_context_pool_t> _g_clients_pool(
-      pool_config, io_context_pool);
+template <typename client_t>
+inline client_pools<client_t>& g_clients_pool(
+    const asio::any_io_executor& io_context_pool,
+    const typename client_pool<client_t>::pool_config& pool_config = {}) {
+  static client_pools<client_t> _g_clients_pool(io_context_pool, pool_config);
   return _g_clients_pool;
 }
 

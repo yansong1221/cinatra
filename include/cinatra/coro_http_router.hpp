@@ -52,7 +52,7 @@ class coro_http_router {
     // std::string_view, avoid memcpy when route
     using return_type = typename util::function_traits<Func>::return_type;
     if constexpr (coro_io::is_lazy_v<return_type>) {
-      std::function<async_simple::coro::Lazy<void>(coro_http_request & req,
+      std::function<asio::awaitable<void>(coro_http_request & req,
                                                    coro_http_response & resp)>
           http_handler;
       if constexpr (sizeof...(Aspects) > 0) {
@@ -60,7 +60,7 @@ class coro_http_router {
                         ... asps = std::forward<Aspects>(asps)](
                            coro_http_request& req,
                            coro_http_response& resp) mutable
-            -> async_simple::coro::Lazy<void> {
+            -> asio::awaitable<void> {
           bool ok = true;
           (do_before(asps, req, resp, ok), ...);
           if (ok) {
@@ -178,7 +178,7 @@ class coro_http_router {
     return nullptr;
   }
 
-  std::function<async_simple::coro::Lazy<void>(coro_http_request& req,
+  std::function<asio::awaitable<void>(coro_http_request& req,
                                                coro_http_response& resp)>*
   get_coro_handler(std::string_view key) {
     if (auto it = coro_handles_.find(key); it != coro_handles_.end()) {
@@ -200,7 +200,7 @@ class coro_http_router {
     }
   }
 
-  async_simple::coro::Lazy<void> route_coro(auto handler, auto& req, auto& resp,
+  asio::awaitable<void> route_coro(auto handler, auto& req, auto& resp,
                                             std::string_view key) {
     try {
       co_await (*handler)(req, resp);
@@ -237,7 +237,7 @@ class coro_http_router {
 
   std::set<std::string> coro_keys_;
   std::unordered_map<std::string_view,
-                     std::function<async_simple::coro::Lazy<void>(
+                     std::function<asio::awaitable<void>(
                          coro_http_request& req, coro_http_response& resp)>>
       coro_handles_;
 
@@ -253,7 +253,7 @@ class coro_http_router {
       regex_handles_;
 
   std::vector<std::tuple<
-      std::regex, std::function<async_simple::coro::Lazy<void>(
+      std::regex, std::function<asio::awaitable<void>(
                       coro_http_request& req, coro_http_response& resp)>>>
       coro_regex_handles_;
 };

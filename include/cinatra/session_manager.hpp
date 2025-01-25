@@ -59,34 +59,9 @@ class session_manager {
     return map_.find(session_id) != map_.end();
   }
 
-  void start_check_session_timer() {
-    check_session_timer_.expires_after(check_session_duration_);
-    check_session_timer_.async_wait([this](auto ec) {
-      if (ec || stop_timer_) {
-        return;
-      }
-
-      remove_expire_session();
-      start_check_session_timer();
-    });
-  }
-
-  void set_check_session_duration(auto duration) {
-    check_session_duration_ = duration;
-    start_check_session_timer();
-  }
-
-  void stop_timer() {
-    stop_timer_ = true;
-    std::error_code ec;
-    check_session_timer_.cancel(ec);
-  }
-
  private:
-  session_manager()
-      : check_session_timer_(
-            coro_io::get_global_executor()->get_asio_executor()) {
-    start_check_session_timer();
+  session_manager(){
+
   };
   session_manager(const session_manager &) = delete;
   session_manager(session_manager &&) = delete;
@@ -97,10 +72,6 @@ class session_manager {
 
   // session_timeout_ should be no less than 0
   std::size_t session_timeout_ = 86400;
-  std::atomic<bool> stop_timer_ = false;
-  asio::steady_timer check_session_timer_;
-  std::chrono::steady_clock::duration check_session_duration_ =
-      std::chrono::seconds(15);
 };
 
 }  // namespace cinatra

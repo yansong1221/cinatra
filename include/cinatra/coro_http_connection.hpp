@@ -24,7 +24,6 @@
 #ifdef CINATRA_ENABLE_GZIP
 #include "gzip.hpp"
 #endif
-#include "ylt/coro_io/coro_file.hpp"
 #include "ylt/coro_io/coro_io.hpp"
 
 namespace cinatra {
@@ -38,9 +37,8 @@ struct websocket_result {
 class coro_http_connection
     : public std::enable_shared_from_this<coro_http_connection> {
  public:
-  template <typename executor_t>
-  coro_http_connection(executor_t *executor, asio::ip::tcp::socket socket,
-                       coro_http_router &router)
+  coro_http_connection(const asio::any_io_executor &executor,
+                       asio::ip::tcp::socket socket, coro_http_router &router)
       : executor_(executor),
         socket_(std::move(socket)),
         router_(router),
@@ -90,7 +88,7 @@ class coro_http_connection
   }
 #endif
 
-  async_simple::coro::Lazy<void> start() {
+  asio::awaitable<void> start() {
 #ifdef CINATRA_ENABLE_SSL
     bool has_shake = false;
 #endif
@@ -110,7 +108,9 @@ class coro_http_connection
         has_shake = true;
       }
 #endif
-      auto [ec, size] = co_await async_read_until(head_buf_, TWO_CRCF);
+      std::error_code ec;
+      auto size = co_await async_read_until(
+          head_buf_, TWO_CRCF, asio::redirect_error(asio::use_awaitable, ec));
       if (ec) {
         if (ec != asio::error::eof) {
           CINATRA_LOG_WARNING << "read http header error: " << ec.message();
@@ -187,9 +187,9 @@ class coro_http_connection
           memcpy(body_.data(), data_ptr, part_size);
           head_buf_.consume(part_size);
 
-          auto [ec, size] = co_await async_read(
+          auto size = co_await async_read(
               asio::buffer(body_.data() + part_size, size_to_read),
-              size_to_read);
+              asio::redirect_error(asio::use_awaitable, ec));
           if (ec) {
             CINATRA_LOG_ERROR << "async_read error: " << ec.message();
             close();
@@ -243,8 +243,8 @@ class coro_http_connection
             }
             else {
               bool is_coro_exist = false;
-              std::function<async_simple::coro::Lazy<void>(
-                  coro_http_request & req, coro_http_response & resp)>
+              std::function<asio::awaitable<void>(coro_http_request & req,
+                                                  coro_http_response & resp)>
                   coro_handler;
 
               std::tie(is_coro_exist, coro_handler, request_.params_) =
@@ -374,7 +374,10 @@ class coro_http_connection
               resp.build_resp_str(resp_str_);
             }
 
-            auto [write_ec, _] = co_await async_write(asio::buffer(resp_str_));
+            std::error_code write_ec;
+            co_await async_write(
+                asio::buffer(resp_str_),
+                asio::redirect_error(asio::use_awaitable, write_ec));
             if (write_ec) {
               CINATRA_LOG_ERROR << "async_write error: " << write_ec.message();
               close();
@@ -401,20 +404,23 @@ class coro_http_connection
     }
   }
 
-  async_simple::coro::Lazy<bool> reply(bool need_to_bufffer = true) {
+  asio::awaitable<bool> reply(bool need_to_bufffer = true) {
     std::error_code ec;
     size_t size;
     if (multi_buf_) {
       if (need_to_bufffer) {
         response_.to_buffers(buffers_, chunk_size_str_);
       }
-      std::tie(ec, size) = co_await async_write(buffers_);
+      size = co_await async_write(
+          buffers_, asio::redirect_error(asio::use_awaitable, ec));
     }
     else {
       if (need_to_bufffer) {
         response_.build_resp_str(resp_str_);
       }
-      std::tie(ec, size) = co_await async_write(asio::buffer(resp_str_));
+      size =
+          co_await async_write(asio::buffer(resp_str_),
+                               asio::redirect_error(asio::use_awaitable, ec));
     }
 
     if (ec) {
@@ -453,8 +459,8 @@ class coro_http_connection
   void set_multi_buf(bool r) { multi_buf_ = r; }
 
   void set_default_handler(
-      std::function<async_simple::coro::Lazy<void>(
-          coro_http_request &, coro_http_response &)> &handler) {
+      std::function<asio::awaitable<void>(coro_http_request &,
+                                          coro_http_response &)> &handler) {
     default_handler_ = handler;
   }
 
@@ -468,10 +474,12 @@ class coro_http_connection
   void set_read_failed_forever(bool r) { read_failed_forever_ = r; }
 #endif
 
-  async_simple::coro::Lazy<bool> write_data(std::string_view message) {
+  asio::awaitable<bool> write_data(std::string_view message) {
     std::vector<asio::const_buffer> buffers;
     buffers.push_back(asio::buffer(message));
-    auto [ec, _] = co_await async_write(buffers);
+    std::error_code ec;
+    co_await async_write(buffers,
+                         asio::redirect_error(asio::use_awaitable, ec));
     if (ec) {
       CINATRA_LOG_ERROR << "async_write error: " << ec.message();
       close();
@@ -486,26 +494,26 @@ class coro_http_connection
     co_return true;
   }
 
-  async_simple::coro::Lazy<bool> begin_chunked() {
+  asio::awaitable<bool> begin_chunked() {
     response_.set_delay(true);
     response_.set_status(status_type::ok);
     co_return co_await reply();
   }
 
-  async_simple::coro::Lazy<bool> write_chunked(std::string_view chunked_data,
-                                               bool eof = false) {
+  asio::awaitable<bool> write_chunked(std::string_view chunked_data,
+                                      bool eof = false) {
     response_.set_delay(true);
     buffers_.clear();
     to_chunked_buffers(buffers_, chunk_size_str_, chunked_data, eof);
     co_return co_await reply(false);
   }
 
-  async_simple::coro::Lazy<bool> end_chunked() {
+  asio::awaitable<bool> end_chunked() {
     co_return co_await write_chunked("", true);
   }
 
-  async_simple::coro::Lazy<bool> begin_multipart(
-      std::string_view boundary = "", std::string_view content_type = "") {
+  asio::awaitable<bool> begin_multipart(std::string_view boundary = "",
+                                        std::string_view content_type = "") {
     response_.set_delay(true);
     response_.set_status(status_type::ok);
     if (boundary.empty()) {
@@ -522,8 +530,8 @@ class coro_http_connection
     co_return co_await reply();
   }
 
-  async_simple::coro::Lazy<bool> write_multipart(
-      std::string_view part_data, std::string_view content_type) {
+  asio::awaitable<bool> write_multipart(std::string_view part_data,
+                                        std::string_view content_type) {
     response_.set_delay(true);
     buffers_.clear();
     std::string part_head = "--";
@@ -537,20 +545,24 @@ class coro_http_connection
     buffers_.push_back(asio::buffer(part_data));
     buffers_.push_back(asio::buffer(CRCF));
 
-    auto [ec, _] = co_await async_write(buffers_);
+    std::error_code ec;
+    co_await async_write(buffers_,
+                         asio::redirect_error(asio::use_awaitable, ec));
     co_return !ec;
   }
 
-  async_simple::coro::Lazy<bool> end_multipart() {
+  asio::awaitable<bool> end_multipart() {
     response_.set_delay(true);
     buffers_.clear();
     std::string multipart_end = "--";
     multipart_end.append(response_.get_boundary()).append("--").append(CRCF);
-    auto [ec, _] = co_await async_write(asio::buffer(multipart_end));
+    std::error_code ec;
+    co_await async_write(asio::buffer(multipart_end),
+                         asio::redirect_error(asio::use_awaitable, ec));
     co_return !ec;
   }
 
-  async_simple::coro::Lazy<chunked_result> read_chunked() {
+  asio::awaitable<chunked_result> read_chunked() {
     if (head_buf_.size() > 0) {
       const char *data_ptr = asio::buffer_cast<const char *>(head_buf_.data());
       chunked_buf_.sputn(data_ptr, head_buf_.size());
@@ -559,10 +571,9 @@ class coro_http_connection
 
     chunked_result result{};
     std::error_code ec{};
-    size_t size = 0;
-
-    if (std::tie(ec, size) = co_await async_read_until(chunked_buf_, CRCF);
-        ec) {
+    auto size = co_await async_read_until(
+        chunked_buf_, CRCF, asio::redirect_error(asio::use_awaitable, ec));
+    if (ec) {
       result.ec = ec;
       close();
       co_return result;
@@ -586,8 +597,10 @@ class coro_http_connection
     if (additional_size < size_t(chunk_size + 2)) {
       // not a complete chunk, read left chunk data.
       size_t size_to_read = chunk_size + 2 - additional_size;
-      if (std::tie(ec, size) = co_await async_read(chunked_buf_, size_to_read);
-          ec) {
+
+      size = co_await async_read(chunked_buf_, size_to_read,
+                                 asio::redirect_error(asio::use_awaitable, ec));
+      if (ec) {
         result.ec = ec;
         close();
         co_return result;
@@ -608,8 +621,9 @@ class coro_http_connection
     co_return result;
   }
 
-  async_simple::coro::Lazy<std::error_code> write_websocket(
-      std::string_view msg, opcode op = opcode::text, bool eof = true) {
+  asio::awaitable<std::error_code> write_websocket(std::string_view msg,
+                                                   opcode op = opcode::text,
+                                                   bool eof = true) {
     std::vector<asio::const_buffer> buffers;
     std::string_view header;
 #ifdef CINATRA_ENABLE_GZIP
@@ -632,12 +646,16 @@ class coro_http_connection
 #ifdef CINATRA_ENABLE_GZIP
     }
 #endif
-    auto [ec, sz] = co_await async_write(buffers);
+    std::error_code ec;
+    co_await async_write(buffers,
+                         asio::redirect_error(asio::use_awaitable, ec));
     co_return ec;
   }
 
-  async_simple::coro::Lazy<websocket_result> read_websocket() {
-    auto [ec, ws_hd_size] = co_await async_read(head_buf_, SHORT_HEADER);
+  asio::awaitable<websocket_result> read_websocket() {
+    std::error_code ec;
+    auto ws_hd_size = co_await async_read(
+        head_buf_, SHORT_HEADER, asio::redirect_error(asio::use_awaitable, ec));
     websocket_result result{ec};
     if (ec) {
       close();
@@ -666,8 +684,9 @@ class coro_http_connection
 
         if (payload_length > 0) {
           detail::resize(body_, payload_length);
-          auto [ec, read_sz] =
-              co_await async_read(asio::buffer(body_), payload_length);
+          auto read_sz = co_await async_read(
+              asio::buffer(body_, payload_length),
+              asio::redirect_error(asio::use_awaitable, ec));
           if (ec) {
             close();
             result.ec = ec;
@@ -738,7 +757,10 @@ class coro_http_connection
         co_return result;
       }
       else if (status == ws_header_status::incomplete) {
-        auto [ec, sz] = co_await async_read(head_buf_, ws_.left_header_len());
+        std::error_code ec;
+        auto sz =
+            co_await async_read(head_buf_, ws_.left_header_len(),
+                                asio::redirect_error(asio::use_awaitable, ec));
         if (ec) {
           close();
           result.ec = ec;
@@ -788,20 +810,18 @@ class coro_http_connection
   }
 
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
-  async_write_failed() {
+  asio::awaitable<std::pair<std::error_code, size_t>> async_write_failed() {
     co_return std::make_pair(std::make_error_code(std::errc::io_error), 0);
   }
 
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
-  async_read_failed() {
+  asio::awaitable<std::pair<std::error_code, size_t>> async_read_failed() {
     co_return std::make_pair(std::make_error_code(std::errc::io_error), 0);
   }
 #endif
 
-  template <typename AsioBuffer>
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_read(
-      AsioBuffer &&buffer, size_t size_to_read) noexcept {
+  template <typename Allocator, typename ReadHandler>
+  auto async_read(asio::basic_streambuf<Allocator> &buffer, size_t size_to_read,
+                  ReadHandler &&handler) noexcept {
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
     if (read_failed_forever_) {
       return async_read_failed();
@@ -810,19 +830,41 @@ class coro_http_connection
     set_last_time();
 #ifdef CINATRA_ENABLE_SSL
     if (use_ssl_) {
-      return coro_io::async_read(*ssl_stream_, buffer, size_to_read);
+      return asio::async_read(*ssl_stream_, buffer,
+                              asio::transfer_exactly(size_to_read), handler);
     }
     else {
 #endif
-      return coro_io::async_read(socket_, buffer, size_to_read);
+      return asio::async_read(socket_, buffer,
+                              asio::transfer_exactly(size_to_read), handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
   }
 
-  template <typename AsioBuffer>
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_write(
-      AsioBuffer &&buffer) {
+  template <typename MutableBufferSequence, typename ReadHandler>
+  auto async_read(const MutableBufferSequence &buffers,
+                  ReadHandler &&handler) noexcept {
+#ifdef INJECT_FOR_HTTP_SEVER_TEST
+    if (read_failed_forever_) {
+      return async_read_failed();
+    }
+#endif
+    set_last_time();
+#ifdef CINATRA_ENABLE_SSL
+    if (use_ssl_) {
+      return asio::async_read(*ssl_stream_, buffers, handler);
+    }
+    else {
+#endif
+      return asio::async_read(socket_, buffers, handler);
+#ifdef CINATRA_ENABLE_SSL
+    }
+#endif
+  }
+
+  template <typename ConstBufferSequence, typename WriteHandler>
+  auto async_write(const ConstBufferSequence &buffers, WriteHandler &&handler) {
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
     if (write_failed_forever_) {
       return async_write_failed();
@@ -831,27 +873,28 @@ class coro_http_connection
     set_last_time();
 #ifdef CINATRA_ENABLE_SSL
     if (use_ssl_) {
-      return coro_io::async_write(*ssl_stream_, buffer);
+      return asio::async_write(*ssl_stream_, buffers, handler);
     }
     else {
 #endif
-      return coro_io::async_write(socket_, buffer);
+      return asio::async_write(socket_, buffers, handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
   }
 
-  template <typename AsioBuffer>
-  async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_read_until(
-      AsioBuffer &buffer, asio::string_view delim) noexcept {
+  template <typename Allocator, typename ReadHandler>
+  auto async_read_until(asio::basic_streambuf<Allocator> &buffer,
+                        const std::string &delim,
+                        ReadHandler &&handler) noexcept {
     set_last_time();
 #ifdef CINATRA_ENABLE_SSL
     if (use_ssl_) {
-      return coro_io::async_read_until(*ssl_stream_, buffer, delim);
+      return asio::async_read_until(*ssl_stream_, buffer, delim, handler);
     }
     else {
 #endif
-      return coro_io::async_read_until(socket_, buffer, delim);
+      return asio::async_read_until(socket_, buffer, delim, handler);
 #ifdef CINATRA_ENABLE_SSL
     }
 #endif
@@ -874,16 +917,13 @@ class coro_http_connection
       return;
     }
 
-    asio::dispatch(socket_.get_executor(),
-                   [this, need_cb, self = shared_from_this()] {
-                     std::error_code ec;
-                     socket_.shutdown(asio::socket_base::shutdown_both, ec);
-                     socket_.close(ec);
-                     if (need_cb && quit_cb_) {
-                       quit_cb_(conn_id_);
-                     }
-                     has_closed_ = true;
-                   });
+    std::error_code ec;
+    socket_.shutdown(asio::socket_base::shutdown_both, ec);
+    socket_.close(ec);
+    if (need_cb && quit_cb_) {
+      quit_cb_(conn_id_);
+    }
+    has_closed_ = true;
   }
 
   void set_check_timeout(bool r) { checkout_timeout_ = r; }
@@ -957,7 +997,7 @@ class coro_http_connection
 
  private:
   friend class multipart_reader_t<coro_http_connection>;
-  coro_io::ExecutorWrapper<> *executor_;
+  asio::any_io_executor executor_;
   asio::ip::tcp::socket socket_;
   coro_http_router &router_;
   asio::streambuf head_buf_;
@@ -989,8 +1029,8 @@ class coro_http_connection
 #endif
   bool need_shrink_every_time_ = false;
   bool multi_buf_ = true;
-  std::function<async_simple::coro::Lazy<void>(coro_http_request &,
-                                               coro_http_response &)>
+  std::function<asio::awaitable<void>(coro_http_request &,
+                                      coro_http_response &)>
       default_handler_ = nullptr;
   std::string chunk_size_str_;
   std::string remote_addr_;
