@@ -1,6 +1,4 @@
 #pragma once
-#include <async_simple/Executor.h>
-#include <async_simple/coro/SyncAwait.h>
 
 #include <asio/buffer.hpp>
 #include <system_error>
@@ -8,7 +6,6 @@
 
 #include "asio/dispatch.hpp"
 #include "asio/streambuf.hpp"
-#include "async_simple/coro/Lazy.h"
 #include "cinatra/cinatra_log_wrapper.hpp"
 #include "cinatra/response_cv.hpp"
 #include "cookie.hpp"

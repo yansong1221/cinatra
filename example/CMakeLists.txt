@@ -1,6 +1,8 @@
 set(project_name cinatra_example)
 project(${project_name})
 
+find_package(Boost REQUIRED COMPONENTS asio)
+
 set(CINATRA_EXAMPLE
 	main.cpp
 	)
@@ -68,6 +70,7 @@ elseif (ENABLE_SIMD STREQUAL "AVX2")
 		set(CMAKE_CXX_FLAGS "-fpermissive")
 	endif ()
 endif ()
-
+target_link_libraries(${project_name} Boost::asio)
+target_link_libraries(benchmark Boost::asio)
 
 install(TARGETS ${project_name} DESTINATION include)

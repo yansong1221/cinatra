@@ -8,8 +8,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "async_simple/coro/Lazy.h"
-#include "async_simple/coro/SyncAwait.h"
 #include "cookie.hpp"
 #include "define.h"
 #ifdef CINATRA_ENABLE_GZIP

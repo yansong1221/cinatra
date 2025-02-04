@@ -35,7 +35,6 @@
 
 #include "../../cinatra_log_wrapper.hpp"
 #include "../util/expected.hpp"
-#include "async_simple/coro/Collect.h"
 #include "coro_io.hpp"
 #include "detail/client_queue.hpp"
 
@@ -62,7 +61,7 @@ class client_pool : public std::enable_shared_from_this<client_pool<client_t>> {
       clients.reselect();
       self = nullptr;
 
-       asio::steady_timer timer(co_await asio::this_coro::executor);
+      asio::steady_timer timer(co_await asio::this_coro::executor);
       timer.expires_after(sleep_time);
       std::error_code ec;
       co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
@@ -183,13 +182,12 @@ class client_pool : public std::enable_shared_from_this<client_pool<client_t>> {
       }
       auto client =
           std::make_unique<client_t>(co_await asio::this_coro::executor);
-      if (!client->init_config(client_config))
-        AS_UNLIKELY {
-          CINATRA_LOG_ERROR
-              << "Init client config failed in host alive detect. That "
-                 "is not expected.";
-          co_return;
-        }
+      if (!client->init_config(client_config)) {
+        CINATRA_LOG_ERROR
+            << "Init client config failed in host alive detect. That "
+               "is not expected.";
+        co_return;
+      }
       while (true) {
         auto [ok, cost_time] = co_await reconnect_impl(client, self);
         if (ok) {
@@ -240,11 +238,10 @@ class client_pool : public std::enable_shared_from_this<client_pool<client_t>> {
     if (client == nullptr) {
       std::unique_ptr<client_t> cli;
       client = std::make_unique<client_t>(io_context_pool_);
-      if (!client->init_config(client_config))
-        AS_UNLIKELY {
-          CINATRA_LOG_ERROR << "init client config failed.";
-          co_return nullptr;
-        }
+      if (!client->init_config(client_config)) {
+        CINATRA_LOG_ERROR << "init client config failed.";
+        co_return nullptr;
+      }
       co_await reconnect(client, this->weak_from_this());
     }
     else {

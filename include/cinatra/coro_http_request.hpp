@@ -7,7 +7,6 @@
 #include <regex>
 #include <string>
 
-#include "async_simple/coro/Lazy.h"
 #include "define.h"
 #include "http_parser.hpp"
 #include "session.hpp"

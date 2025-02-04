@@ -1,6 +1,5 @@
 #pragma once
 
-#include <async_simple/coro/Lazy.h>
 
 #include <functional>
 #include <string>

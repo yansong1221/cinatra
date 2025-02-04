@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #pragma once
-#include <async_simple/coro/Lazy.h>
 
 #include <atomic>
 #include <memory>

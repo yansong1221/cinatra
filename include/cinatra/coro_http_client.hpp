@@ -16,21 +16,14 @@
 #include <unordered_map>
 #include <utility>
 
-#include "asio/awaitable.hpp"
-#include "asio/dispatch.hpp"
-#include "asio/error.hpp"
-#include "asio/experimental/awaitable_operators.hpp"
-#include "asio/redirect_error.hpp"
-#include "asio/steady_timer.hpp"
-#include "asio/stream_file.hpp"
-#include "asio/streambuf.hpp"
+#include <asio.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #ifdef CINATRA_ENABLE_GZIP
 #include "gzip.hpp"
 #endif
 #ifdef CINATRA_ENABLE_BROTLI
 #include "brzip.hpp"
 #endif
-#include "asio.hpp"
 #include "cinatra_log_wrapper.hpp"
 #include "http_parser.hpp"
 #include "multipart.hpp"
@@ -120,8 +113,8 @@ enum class upload_type_t { with_length, chunked, multipart };
 class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
  public:
   struct config {
-    std::optional<std::chrono::steady_clock::duration> conn_timeout_duration;
-    std::optional<std::chrono::steady_clock::duration> req_timeout_duration;
+    std::optional<std::chrono::milliseconds> conn_timeout_duration;
+    std::optional<std::chrono::milliseconds> req_timeout_duration;
     std::string sec_key;
     size_t max_single_part_size;
     std::string proxy_host;
@@ -1521,11 +1514,11 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     return false;
   }
 
-  void set_conn_timeout(std::chrono::steady_clock::duration timeout_duration) {
+  void set_conn_timeout(std::chrono::milliseconds timeout_duration) {
     conn_timeout_duration_ = timeout_duration;
   }
 
-  void set_req_timeout(std::chrono::steady_clock::duration timeout_duration) {
+  void set_req_timeout(std::chrono::milliseconds timeout_duration) {
     req_timeout_duration_ = timeout_duration;
   }
 
@@ -2531,9 +2524,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 #endif
   std::string redirect_uri_;
   bool enable_follow_redirect_ = false;
-  std::chrono::steady_clock::duration conn_timeout_duration_ =
+  std::chrono::milliseconds conn_timeout_duration_ =
       std::chrono::seconds(30);
-  std::chrono::steady_clock::duration req_timeout_duration_ =
+  std::chrono::milliseconds req_timeout_duration_ =
       std::chrono::seconds(60);
   bool enable_tcp_no_delay_ = true;
   std::string resp_chunk_str_;

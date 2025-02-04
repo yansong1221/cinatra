@@ -15,12 +15,6 @@
  */
 #pragma once
 
-#include <async_simple/Executor.h>
-#include <async_simple/coro/Collect.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/Sleep.h>
-#include <async_simple/coro/SyncAwait.h>
-
 #if defined(YLT_ENABLE_SSL) || defined(CINATRA_ENABLE_SSL)
 #include <asio/ssl.hpp>
 #endif
